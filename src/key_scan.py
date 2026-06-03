@@ -365,7 +365,10 @@ def _try_hook_on_pid(pid, db_files, salt_to_dbs, key_map, print_fn, timeout=30):
         import time as _time
         start = _time.time()
         found_count = 0
+        unverified_count = 0
         last_report = start
+        _first_key_logged = False
+        seen_keys = set()  # deduplicate captured keys
         while _time.time() - start < timeout:
             # Drain status messages from C++ side
             msg, level = wx_key.get_status_message()
@@ -377,16 +380,26 @@ def _try_hook_on_pid(pid, db_files, salt_to_dbs, key_map, print_fn, timeout=30):
             res = wx_key.poll_key_data()
             if res and 'key' in res:
                 key_hex = res['key'].lower()
-                if len(key_hex) == 64:
+                if len(key_hex) == 64 and key_hex not in seen_keys:
+                    seen_keys.add(key_hex)
                     key_bytes = bytes.fromhex(key_hex)
+                    verified = False
                     for salt_hex, page1 in list(salt_to_page1.items()):
                         if verify_enc_key(key_bytes, page1):
                             key_map[salt_hex] = key_hex
                             found_count += 1
                             print_fn(f"  [Hook-FOUND] salt={salt_hex} DBs={salt_to_dbs[salt_hex]}")
                             del salt_to_page1[salt_hex]
+                            verified = True
                             if len(key_map) >= len(salt_to_dbs):
                                 break
+                    if not verified:
+                        unverified_count += 1
+                        if not _first_key_logged:
+                            _first_key_logged = True
+                            print_fn(f"[Hook:diag] First captured key (unverified): {key_hex}")
+                            print_fn("[Hook:diag] Key verifies against 0 of remaining salts — "
+                                     "likely wrong struct offset or derived key, not raw DB key")
                     if len(key_map) >= len(salt_to_dbs):
                         break
 
@@ -398,7 +411,8 @@ def _try_hook_on_pid(pid, db_files, salt_to_dbs, key_map, print_fn, timeout=30):
 
             _time.sleep(0.1)
 
-        print_fn(f"[Hook] Captured {found_count} keys in {_time.time() - start:.1f}s")
+        print_fn(f"[Hook] Captured {found_count} verified keys in {_time.time() - start:.1f}s"
+                 f" ({unverified_count} unverified, {len(seen_keys)} unique captures)")
         return found_count
     finally:
         wx_key.cleanup_hook()
