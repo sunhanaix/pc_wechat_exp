@@ -310,37 +310,12 @@ def _extract_keys_from_mmkv(db_dir, db_files, salt_to_dbs, print_fn):
     return key_map
 
 
-def _extract_keys_via_hook(db_dir, db_files, salt_to_dbs, key_map, print_fn, timeout=30):
-    """Extract DB keys via py_wx_key API hooking (intercepts sqlite3_key()).
-
-    Requires: py_wx_key installed, WeChat running, admin privileges.
-
-    Returns updated key_map dict (mutated in place for incremental verification).
-    """
-    # Check prerequisites
-    try:
-        import wx_key
-    except ImportError:
-        print_fn("[Hook] py_wx_key not installed — skipping hook extraction")
-        return
-
-    # Check admin (required for DLL injection)
-    is_admin = False
-    try:
-        is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
-    except Exception:
-        pass
-    if not is_admin:
-        print_fn("[Hook] Not running as admin — skipping hook extraction")
-        return
-
-    # Find WeChat PID via psutil — use largest memory process (main proc)
+def _find_wechat_pids():
+    """Return list of (rss_bytes, pid) for weixin.exe, sorted by memory desc."""
     try:
         import psutil
     except ImportError:
-        print_fn("[Hook] psutil not installed — skipping hook extraction")
-        return
-
+        return []
     candidates = []
     for proc in psutil.process_iter(['pid', 'name', 'memory_info']):
         try:
@@ -350,68 +325,173 @@ def _extract_keys_via_hook(db_dir, db_files, salt_to_dbs, key_map, print_fn, tim
                 candidates.append((mem, info['pid']))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
-
-    if not candidates:
-        print_fn("[Hook] Weixin.exe not running — skipping hook extraction")
-        return
-
-    # Pick the largest — that's the main UI process with DB connections
     candidates.sort(reverse=True)
-    print_fn(f"[Hook] Weixin.exe PIDs found: {[p for _,p in candidates]}")
+    return candidates
 
-    # Try each candidate in descending size order
-    for mem_size, pid in candidates:
-        print_fn(f"[Hook] Trying PID={pid} ({mem_size//1048576}MB)...")
 
-        # Build salt -> page1 lookup for remaining salts
-        remaining_salts = set(salt_to_dbs.keys()) - set(key_map.keys())
-        salt_to_page1 = {}
-        for rel, path, sz, salt_hex, page1 in db_files:
-            if salt_hex in remaining_salts:
-                salt_to_page1[salt_hex] = page1
+def _try_hook_on_pid(pid, db_files, salt_to_dbs, key_map, print_fn, timeout=30):
+    """Install hook on a single PID and poll for keys. Returns count found."""
+    import wx_key
 
-        # Install hook
-        if not wx_key.initialize_hook(pid):
-            err = wx_key.get_last_error_msg()
-            print_fn(f"[Hook] PID={pid} init failed: {err}")
-            continue
-        print_fn("[Hook] Hook installed, polling for keys...")
+    remaining_salts = set(salt_to_dbs.keys()) - set(key_map.keys())
+    if not remaining_salts:
+        return 0
 
-        try:
-            import time as _time
-            start = _time.time()
-            found_count = 0
-            while _time.time() - start < timeout:
-                res = wx_key.poll_key_data()
-                if res and 'key' in res:
-                    key_hex = res['key'].lower()
-                    if len(key_hex) != 64:
-                        continue
+    salt_to_page1 = {}
+    for rel, path, sz, salt_hex, page1 in db_files:
+        if salt_hex in remaining_salts:
+            salt_to_page1[salt_hex] = page1
+
+    # Flush any stale status messages before init
+    msg, level = wx_key.get_status_message()
+    while msg:
+        msg, level = wx_key.get_status_message()
+
+    if not wx_key.initialize_hook(pid):
+        err = wx_key.get_last_error_msg()
+        print_fn(f"[Hook] PID={pid} init failed: {err}")
+        return 0
+
+    # Print status messages from C++ side during init
+    msg, level = wx_key.get_status_message()
+    while msg:
+        print_fn(f"[Hook:status] {msg}")
+        msg, level = wx_key.get_status_message()
+
+    print_fn(f"[Hook] PID={pid} — polling for sqlite3_key() calls...")
+    print_fn("[Hook] TIP: Navigate WeChat (open chats, Moments, Favorites, Stickers)")
+
+    try:
+        import time as _time
+        start = _time.time()
+        found_count = 0
+        last_report = start
+        while _time.time() - start < timeout:
+            # Drain status messages from C++ side
+            msg, level = wx_key.get_status_message()
+            while msg:
+                if level >= 1:
+                    print_fn(f"[Hook:diag] {msg}")
+                msg, level = wx_key.get_status_message()
+
+            res = wx_key.poll_key_data()
+            if res and 'key' in res:
+                key_hex = res['key'].lower()
+                if len(key_hex) == 64:
                     key_bytes = bytes.fromhex(key_hex)
-
-                    # Verify against all remaining salts
                     for salt_hex, page1 in list(salt_to_page1.items()):
                         if verify_enc_key(key_bytes, page1):
                             key_map[salt_hex] = key_hex
                             found_count += 1
                             print_fn(f"  [Hook-FOUND] salt={salt_hex} DBs={salt_to_dbs[salt_hex]}")
                             del salt_to_page1[salt_hex]
-
                             if len(key_map) >= len(salt_to_dbs):
                                 break
-
                     if len(key_map) >= len(salt_to_dbs):
                         break
 
-                _time.sleep(0.1)
+            # Periodic heartbeat so user knows we're still polling
+            elapsed = _time.time() - last_report
+            if elapsed >= 10:
+                print_fn(f"[Hook] Still polling... ({_time.time() - start:.0f}s elapsed, {found_count} keys so far)")
+                last_report = _time.time()
 
-            print_fn(f"[Hook] Captured {found_count} keys in {_time.time() - start:.1f}s")
-        finally:
-            wx_key.cleanup_hook()
-            print_fn("[Hook] Hook cleaned up")
+            _time.sleep(0.1)
 
-        if found_count > 0:
-            break  # Success, don't try other PIDs
+        print_fn(f"[Hook] Captured {found_count} keys in {_time.time() - start:.1f}s")
+        return found_count
+    finally:
+        wx_key.cleanup_hook()
+        # Drain final status messages
+        msg, level = wx_key.get_status_message()
+        while msg:
+            msg, level = wx_key.get_status_message()
+
+
+def _extract_keys_via_hook(db_dir, db_files, salt_to_dbs, key_map, print_fn, timeout=30):
+    """Extract DB keys via py_wx_key API hooking (intercepts sqlite3_key()).
+
+    Requires: py_wx_key installed, WeChat running, admin privileges.
+
+    The hook only captures keys from sqlite3_key() calls made AFTER installation.
+    In an already-running WeChat, databases may already be open — in that case,
+    you need to restart WeChat while the hook is active to capture keys during
+    login/initialization.
+
+    Returns updated key_map dict (mutated in place for incremental verification).
+    """
+    try:
+        import wx_key
+    except ImportError:
+        print_fn("[Hook] py_wx_key not installed — skipping hook extraction")
+        return
+
+    is_admin = False
+    try:
+        is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        pass
+    if not is_admin:
+        print_fn("[Hook] Not running as admin — skipping hook extraction")
+        return
+
+    import time as _time
+
+    # --- Phase 1: Try hooking currently running WeChat ---
+    candidates = _find_wechat_pids()
+    if candidates:
+        print_fn(f"[Hook] Weixin.exe PIDs found: {[p for _,p in candidates]}")
+        for mem_size, pid in candidates:
+            print_fn(f"[Hook] Trying PID={pid} ({mem_size//1048576}MB)...")
+            found = _try_hook_on_pid(pid, db_files, salt_to_dbs, key_map, print_fn, timeout)
+            if found > 0:
+                return
+        print_fn("[Hook] No keys captured from running WeChat.")
+        print_fn("[Hook] This is expected if WeChat opened all DBs before hook was installed.")
+    else:
+        print_fn("[Hook] WeChat is not running.")
+
+    # --- Phase 2: Wait for WeChat restart ---
+    remaining = len(salt_to_dbs) - len(key_map)
+    if remaining == 0:
+        return
+    print_fn(f"[Hook] {remaining} keys still needed. Waiting for WeChat restart...")
+    print_fn("[Hook] >>> Close WeChat completely, then restart and login <<<")
+    print_fn("[Hook] Monitoring for new Weixin.exe process (Ctrl+C to cancel)...")
+
+    # Record current PIDs so we can detect the NEW one after restart
+    known_pids = set(p for _, p in _find_wechat_pids())
+
+    wait_start = _time.time()
+    wait_timeout = 120  # 2 minutes for user to restart
+    while _time.time() - wait_start < wait_timeout:
+        current = _find_wechat_pids()
+        current_pids = set(p for _, p in current)
+
+        # Check if old WeChat exited
+        exited = known_pids - current_pids
+        if exited and known_pids:
+            print_fn("[Hook] WeChat closed. Waiting for restart...")
+            known_pids = current_pids  # track new PIDs going forward
+
+        # Check for new PID
+        new_pids = current_pids - known_pids
+        if new_pids:
+            # New WeChat process started — hook it immediately
+            # Pick the largest new PID
+            for mem_size, pid in current:
+                if pid in new_pids:
+                    print_fn(f"[Hook] New Weixin.exe detected: PID={pid} ({mem_size//1048576}MB)")
+                    print_fn("[Hook] Installing hook BEFORE login completes...")
+                    found = _try_hook_on_pid(pid, db_files, salt_to_dbs, key_map, print_fn, timeout=60)
+                    if found > 0:
+                        return
+                    break
+            known_pids.update(new_pids)
+
+        _time.sleep(1)
+
+    print_fn("[Hook] Timeout waiting for WeChat restart — continuing with other strategies")
 
 
 def collect_db_files(db_dir):
