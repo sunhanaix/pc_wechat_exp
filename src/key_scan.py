@@ -143,6 +143,270 @@ def verify_enc_key(enc_key, db_page1):
     return hm.digest() == stored_hmac
 
 
+def _clean_wxid(wxid):
+    """去除 wxid 第二个下划线后的后缀。
+    'wxid_cpyn7pe119rs21_10e8' -> 'wxid_cpyn7pe119rs21'
+    """
+    if not wxid or not wxid.startswith('wxid_'):
+        return wxid
+    parts = wxid.split('_')
+    if len(parts) >= 3:
+        return '_'.join(parts[:2])
+    return wxid
+
+
+def _extract_keys_from_mmkv(db_dir, db_files, salt_to_dbs, print_fn):
+    """从 MMKV 配置文件中提取数据库加密密钥（微信 4.1.10.x+）。
+
+    db_storage/MMKV/ 下的 MMKV 文件使用 AES-GCM 加密。
+    AES 密钥通过 MD5(str(code) + cleaned_wxid).hex()[:16] 派生。
+
+    返回 key_map dict {salt_hex: enc_key_hex}。
+    """
+    key_map = {}
+
+    mmkv_dir = os.path.join(db_dir, 'MMKV')
+    if not os.path.isdir(mmkv_dir):
+        print_fn("[MMKV] db_storage/MMKV/ 不存在 — 跳过 MMKV 提取")
+        return key_map
+
+    # 从 db_dir 路径提取 wxid
+    # e.g. D:\xwechat_files\wxid_cpyn7pe119rs21_10e8\db_storage
+    wxid_full = os.path.basename(os.path.dirname(db_dir))
+    wxid_clean = _clean_wxid(wxid_full)
+    if not wxid_clean or not wxid_clean.startswith('wxid_'):
+        print_fn(f"[MMKV] 无法从路径提取 wxid: {db_dir}")
+        return key_map
+
+    print_fn(f"[MMKV] wxid: {wxid_full} -> cleaned: {wxid_clean}")
+
+    # 枚举 MMKV 文件，从文件名提取 code
+    # 模式: f<hex>tinfo.mmkv -> code = int(hex, 16)
+    # 其他: storage_common 等 -> 使用 None (仅 wxid 回退)
+    import re as _re
+    _CODE_RE = _re.compile(r'^f([0-9a-fA-F]+)tinfo\.mmkv$')
+
+    codes = {}
+    try:
+        for fname in os.listdir(mmkv_dir):
+            if fname.endswith('.crc'):
+                continue
+            m = _CODE_RE.match(fname)
+            if m:
+                code = int(m.group(1), 16)
+                codes[code] = os.path.join(mmkv_dir, fname)
+            elif fname.endswith('.mmkv'):
+                codes[fname] = os.path.join(mmkv_dir, fname)
+    except OSError as e:
+        print_fn(f"[MMKV] 无法列出 MMKV 目录: {e}")
+        return key_map
+
+    if not codes:
+        print_fn("[MMKV] 未找到 .mmkv 文件")
+        return key_map
+
+    print_fn(f"[MMKV] 找到 {len(codes)} 个 MMKV 文件")
+
+    # 构建 rel_path -> (salt_hex, page1) 查找表
+    path_to_info = {}
+    for rel, path, sz, salt_hex, page1 in db_files:
+        path_to_info[rel] = (salt_hex, page1)
+        path_to_info[rel.replace('\\', '/')] = (salt_hex, page1)
+
+    # 尝试导入 pycryptodome (项目已有依赖)
+    try:
+        from Crypto.Cipher import AES
+    except ImportError:
+        print_fn("[MMKV] pycryptodome 不可用 — 跳过 MMKV 提取")
+        return key_map
+
+    _HEX64_RE = _re.compile(b'([0-9a-fA-F]{64})')
+
+    # 逐个尝试每个 code
+    for code_or_label, filepath in codes.items():
+        if len(key_map) >= len(salt_to_dbs):
+            break
+
+        # 派生 AES 密钥
+        if isinstance(code_or_label, int):
+            aes_key_str = hashlib.md5(
+                f"{code_or_label}{wxid_clean}".encode()
+            ).hexdigest()[:16]
+        else:
+            aes_key_str = hashlib.md5(
+                wxid_clean.encode()
+            ).hexdigest()[:16]
+        aes_key = aes_key_str.encode('ascii')
+
+        label = code_or_label if isinstance(code_or_label, int) else f"'{code_or_label}'"
+        print_fn(f"[MMKV] 尝试 code={label} key={aes_key_str}...")
+
+        # 读取并解密 MMKV 文件
+        try:
+            with open(filepath, 'rb') as f:
+                raw = f.read()
+        except (IOError, PermissionError) as e:
+            print_fn(f"[MMKV] 无法读取 {filepath}: {e}")
+            continue
+
+        if len(raw) < 24:
+            continue
+
+        total_size = struct.unpack('<I', raw[:4])[0]
+        # MMKV files may be padded to page size (4096); use header value
+        if total_size < 33 or 4 + total_size > len(raw):
+            continue
+
+        iv = raw[4:20]
+        ciphertext = raw[20:4 + total_size - 16]
+        auth_tag = raw[4 + total_size - 16:4 + total_size]
+
+        try:
+            cipher = AES.new(aes_key, AES.MODE_GCM, nonce=iv)
+            plaintext = cipher.decrypt_and_verify(ciphertext, auth_tag)
+        except (ValueError, KeyError):
+            print_fn(f"[MMKV] GCM 认证失败 code={label}")
+            continue
+        except Exception as e:
+            print_fn(f"[MMKV] 解密错误 code={label}: {e}")
+            continue
+
+        print_fn(f"[MMKV] 解密 {os.path.basename(filepath)}: {len(plaintext)} 字节")
+
+        # 在解密数据中搜索 DB 路径 → 64 字符 hex 密钥
+        for rel, (salt_hex, page1) in path_to_info.items():
+            if salt_hex in key_map:
+                continue
+
+            for sep in [b'\\', b'/']:
+                path_bytes = rel.replace('\\', sep.decode()).encode()
+                pos = plaintext.find(path_bytes)
+                while pos >= 0:
+                    nearby_start = pos + len(path_bytes)
+                    nearby_end = min(len(plaintext), nearby_start + 512)
+                    nearby = plaintext[nearby_start:nearby_end]
+
+                    for hex_match in _HEX64_RE.finditer(nearby):
+                        candidate_hex = hex_match.group(0).decode()
+                        try:
+                            candidate_key = bytes.fromhex(candidate_hex)
+                        except ValueError:
+                            continue
+                        if verify_enc_key(candidate_key, page1):
+                            key_map[salt_hex] = candidate_hex
+                            print_fn(f"\n  [MMKV-FOUND] salt={salt_hex}")
+                            print_fn(f"    enc_key={candidate_hex}")
+                            print_fn(f"    DB: {rel}")
+                            break
+
+                    if salt_hex in key_map:
+                        break
+                    pos = plaintext.find(path_bytes, pos + 1)
+
+                if salt_hex in key_map:
+                    break
+
+    print_fn(f"[MMKV] 从 MMKV 提取了 {len(key_map)}/{len(salt_to_dbs)} 个密钥")
+    return key_map
+
+
+def _extract_keys_via_hook(db_dir, db_files, salt_to_dbs, key_map, print_fn, timeout=30):
+    """Extract DB keys via py_wx_key API hooking (intercepts sqlite3_key()).
+
+    Requires: py_wx_key installed, WeChat running, admin privileges.
+
+    Returns updated key_map dict (mutated in place for incremental verification).
+    """
+    # Check prerequisites
+    try:
+        import wx_key
+    except ImportError:
+        print_fn("[Hook] py_wx_key not installed — skipping hook extraction")
+        return
+
+    # Check admin (required for DLL injection)
+    is_admin = False
+    try:
+        is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+    except Exception:
+        pass
+    if not is_admin:
+        print_fn("[Hook] Not running as admin — skipping hook extraction")
+        return
+
+    # Find WeChat PID via psutil
+    try:
+        import psutil
+    except ImportError:
+        print_fn("[Hook] psutil not installed — skipping hook extraction")
+        return
+
+    pid = None
+    for proc in psutil.process_iter(['pid', 'name']):
+        try:
+            if proc.info['name'] and proc.info['name'].lower() == 'weixin.exe':
+                pid = proc.info['pid']
+                break
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            continue
+
+    if not pid:
+        print_fn("[Hook] Weixin.exe not running — skipping hook extraction")
+        return
+
+    print_fn(f"[Hook] Weixin.exe PID={pid}, installing hook...")
+
+    # Build salt -> page1 lookup for remaining salts
+    remaining_salts = set(salt_to_dbs.keys()) - set(key_map.keys())
+    if not remaining_salts:
+        print_fn("[Hook] All keys already found — skipping hook")
+        return
+
+    salt_to_page1 = {}
+    for rel, path, sz, salt_hex, page1 in db_files:
+        if salt_hex in remaining_salts:
+            salt_to_page1[salt_hex] = page1
+
+    # Install hook
+    if not wx_key.initialize_hook(pid):
+        print_fn(f"[Hook] Init failed: {wx_key.get_last_error_msg()}")
+        return
+    print_fn("[Hook] Hook installed, polling for keys...")
+
+    try:
+        import time as _time
+        start = _time.time()
+        found_count = 0
+        while _time.time() - start < timeout:
+            res = wx_key.poll_key_data()
+            if res and 'key' in res:
+                key_hex = res['key'].lower()
+                if len(key_hex) != 64:
+                    continue
+                key_bytes = bytes.fromhex(key_hex)
+
+                # Verify against all remaining salts
+                for salt_hex, page1 in list(salt_to_page1.items()):
+                    if verify_enc_key(key_bytes, page1):
+                        key_map[salt_hex] = key_hex
+                        found_count += 1
+                        print_fn(f"  [Hook-FOUND] salt={salt_hex} DBs={salt_to_dbs[salt_hex]}")
+                        del salt_to_page1[salt_hex]
+
+                        if len(key_map) >= len(salt_to_dbs):
+                            break
+
+                if len(key_map) >= len(salt_to_dbs):
+                    break
+
+            _time.sleep(0.1)
+
+        print_fn(f"[Hook] Captured {found_count} keys in {_time.time() - start:.1f}s")
+    finally:
+        wx_key.cleanup_hook()
+        print_fn("[Hook] Hook cleaned up")
+
+
 def collect_db_files(db_dir):
     """遍历 db_dir 收集所有 .db 文件及其 salt。"""
     db_files = []
@@ -443,47 +707,64 @@ def run_key_scan(db_dir, out_file, print_fn=None, progress_fn=None):
 
     hex_re = re.compile(b"x'([0-9a-fA-F]{64,192})'")
     key_map = {}
-    remaining_salts = set(salt_to_dbs.keys())
-    all_hex_matches = 0
     t0 = time.time()
 
-    pids = get_pids()
-    for pid_idx, (pid, mem_kb) in enumerate(pids):
-        progress_fn(10 + pid_idx * 30, f"扫描进程 PID={pid} ({mem_kb // 1024}MB)...")
+    # Strategy 1: MMKV 离线提取 (新版本)
+    mmkv_keys = _extract_keys_from_mmkv(db_dir, db_files, salt_to_dbs, print_fn)
+    if mmkv_keys:
+        key_map.update(mmkv_keys)
+        print_fn(f"[MMKV] {len(mmkv_keys)} 个密钥从 MMKV 配置文件提取")
 
-        h = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
-        if not h:
-            print_fn(f"[WARN] 无法打开进程 PID={pid}，跳过")
-            continue
+    # Strategy 2: py_wx_key API Hook (注入拦截 sqlite3_key)
+    remaining_salts = set(salt_to_dbs.keys()) - set(key_map.keys())
+    if remaining_salts:
+        _extract_keys_via_hook(db_dir, db_files, salt_to_dbs, key_map, print_fn)
 
-        try:
-            regions = enum_regions(h)
-            total_bytes = sum(s for _, s in regions)
-            total_mb = total_bytes / 1024 / 1024
-            print_fn(f"\n[*] 扫描 PID={pid} ({total_mb:.0f}MB, {len(regions)} 区域)")
+    remaining_salts = set(salt_to_dbs.keys()) - set(key_map.keys())
+    if remaining_salts:
+        print_fn(f"[*] {len(remaining_salts)} 个 salt 仍需内存扫描")
 
-            scanned_bytes = 0
-            for reg_idx, (base, size) in enumerate(regions):
-                data = read_mem(h, base, size)
-                scanned_bytes += size
-                if not data:
-                    continue
+    all_hex_matches = 0
+    pids = []
 
-                all_hex_matches += scan_memory_for_keys(
-                    data, hex_re, db_files, salt_to_dbs,
-                    key_map, remaining_salts, base, pid, print_fn,
-                )
+    if remaining_salts:
+        pids = get_pids()
+        for pid_idx, (pid, mem_kb) in enumerate(pids):
+            progress_fn(10 + pid_idx * 30, f"扫描进程 PID={pid} ({mem_kb // 1024}MB)...")
 
-                if (reg_idx + 1) % 200 == 0:
-                    elapsed = time.time() - t0
-                    pct = min(99, 10 + scanned_bytes / total_bytes * 80)
-                    progress_fn(pct, f"已匹配 {len(key_map)}/{len(salt_to_dbs)} salt, {elapsed:.0f}s")
-        finally:
-            kernel32.CloseHandle(h)
+            h = kernel32.OpenProcess(0x0010 | 0x0400, False, pid)
+            if not h:
+                print_fn(f"[WARN] 无法打开进程 PID={pid}，跳过")
+                continue
 
-        if not remaining_salts:
-            print_fn(f"\n[+] 所有密钥已找到，跳过剩余进程")
-            break
+            try:
+                regions = enum_regions(h)
+                total_bytes = sum(s for _, s in regions)
+                total_mb = total_bytes / 1024 / 1024
+                print_fn(f"\n[*] 扫描 PID={pid} ({total_mb:.0f}MB, {len(regions)} 区域)")
+
+                scanned_bytes = 0
+                for reg_idx, (base, size) in enumerate(regions):
+                    data = read_mem(h, base, size)
+                    scanned_bytes += size
+                    if not data:
+                        continue
+
+                    all_hex_matches += scan_memory_for_keys(
+                        data, hex_re, db_files, salt_to_dbs,
+                        key_map, remaining_salts, base, pid, print_fn,
+                    )
+
+                    if (reg_idx + 1) % 200 == 0:
+                        elapsed = time.time() - t0
+                        pct = min(99, 10 + scanned_bytes / total_bytes * 80)
+                        progress_fn(pct, f"已匹配 {len(key_map)}/{len(salt_to_dbs)} salt, {elapsed:.0f}s")
+            finally:
+                kernel32.CloseHandle(h)
+
+            if not remaining_salts:
+                print_fn(f"\n[+] 所有密钥已找到，跳过剩余进程")
+                break
 
     elapsed = time.time() - t0
     print_fn(f"\n扫描完成: {elapsed:.1f}s, {len(pids)} 个进程, {all_hex_matches} hex模式")
