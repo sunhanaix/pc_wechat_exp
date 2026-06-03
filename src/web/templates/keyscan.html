@@ -1,15 +1,56 @@
 {% extends "base.html" %}
 {% block title %}提取密钥 — WeChat EXP{% endblock %}
 {% block content %}
-<a href="/" class="back-link">← 返回仪表盘</a>
+<a href="/" class="back-link">&larr; 返回仪表盘</a>
 <h2 style="margin:0 0 4px 0">🔑 提取密钥</h2>
-<p style="color:#8b949e;font-size:12px;margin:0 0 20px 0">从微信进程内存中扫描 SQLCipher 数据库密钥</p>
+<p style="color:#8b949e;font-size:12px;margin:0 0 16px 0">从微信进程中提取 SQLCipher 数据库解密密钥</p>
 
 <div class="config-panel">
-  <div class="form-row">
-    <div><label>&nbsp;</label><button id="btn-run" class="btn btn-primary">开始扫描</button></div>
+  <!-- Mode selector -->
+  <div class="mode-tabs" style="display:flex;gap:8px;margin-bottom:16px">
+    <button id="tab-memory" class="btn btn-primary" style="font-size:13px">内存扫描</button>
+    <button id="tab-hook" class="btn" style="font-size:13px">⚡ Hook拦截 <span style="font-size:10px;opacity:0.7">(推荐 4.1.10+)</span></button>
   </div>
-  <p style="font-size:11px;color:#d29922;margin-top:8px">⚠ 请确保微信已登录运行，否则无法从内存中提取密钥。</p>
+
+  <!-- Memory scan panel -->
+  <div id="panel-memory">
+    <p style="font-size:11px;color:#d29922;margin:0 0 12px 0">⚠ 从微信进程内存中搜索密钥。微信需保持运行。4.1.10+ 版本可能失效。</p>
+    <button id="btn-run-memory" class="btn btn-primary">开始内存扫描</button>
+  </div>
+
+  <!-- Hook panel -->
+  <div id="panel-hook" style="display:none">
+    <p style="font-size:11px;color:#58a6ff;margin:0 0 12px 0">💡 通过 DLL 注入拦截 <code>sqlite3_key()</code> 调用，在微信登录过程中捕获密钥。需要管理员权限。</p>
+    <button id="btn-run-hook" class="btn btn-primary">开始 Hook 提取</button>
+  </div>
+</div>
+
+<!-- Hook interactive steps -->
+<div id="hook-steps" style="display:none;margin:16px 0">
+  <div class="step-list" style="display:flex;gap:16px;margin-bottom:16px">
+    <div class="hook-step" data-step="check">
+      <span class="step-dot">○</span> 检查环境
+    </div>
+    <div class="hook-step-arrow">&rarr;</div>
+    <div class="hook-step" data-step="wait_exit">
+      <span class="step-dot">○</span> 退出微信
+    </div>
+    <div class="hook-step-arrow">&rarr;</div>
+    <div class="hook-step" data-step="wait_login">
+      <span class="step-dot">○</span> 重新登录
+    </div>
+    <div class="hook-step-arrow">&rarr;</div>
+    <div class="hook-step" data-step="install">
+      <span class="step-dot">○</span> 安装Hook
+    </div>
+    <div class="hook-step-arrow">&rarr;</div>
+    <div class="hook-step" data-step="polling">
+      <span class="step-dot">○</span> 捕获密钥
+    </div>
+  </div>
+  <div id="hook-instruction" style="background:#1a1a2e;border:1px solid #30363d;border-radius:8px;padding:16px;font-size:14px;color:#e6edf3;line-height:1.6">
+    等待开始...
+  </div>
 </div>
 
 <div id="progress-container" class="progress-panel" style="display:none">
@@ -19,7 +60,7 @@
 </div>
 
 <div id="result-container" class="result-panel" style="display:none">
-  <h3>✓ 密钥提取完成</h3>
+  <h3 id="result-title">✓ 密钥提取完成</h3>
   <div id="result-content"></div>
 </div>
 {% endblock %}
@@ -27,23 +68,212 @@
 <script src="{{ url_for('static', filename='js/sse_progress.js') }}"></script>
 <script src="{{ url_for('static', filename='js/wizard.js') }}"></script>
 <script>
-const page = new WizardPage({
-  runBtnId: 'btn-run',
+// Shared utilities
+function escapeHtml(str) {
+  const div = document.createElement('div');
+  div.textContent = str;
+  return div.innerHTML;
+}
+
+// ========== Memory Scan Mode ==========
+const memoryPage = new WizardPage({
+  runBtnId: 'btn-run-memory',
   apiUrl: '/api/backup/keyscan',
   steps: ['scan'],
   getBody: () => ({ force: false }),
 });
 
-page.showResult = function(result) {
+memoryPage.showResult = function(result) {
   WizardPage.prototype.showResult.call(this, result);
   let html = '<dl class="result-stats">';
   if (result.keys !== undefined) html += '<dt>发现密钥</dt><dd>' + result.keys + ' 个</dd>';
   if (result.file) html += '<dt>保存位置</dt><dd><code>' + result.file + '</code></dd>';
   html += '</dl>';
   if (result.output) {
-    html += '<pre style="font-size:11px;background:#0d1117;padding:8px;border-radius:4px;max-height:200px;overflow:auto;margin-top:8px">' + result.output + '</pre>';
+    html += '<pre style="font-size:11px;background:#0d1117;padding:8px;border-radius:4px;max-height:200px;overflow:auto;margin-top:8px">' + escapeHtml(result.output) + '</pre>';
   }
   document.getElementById('result-content').innerHTML = html;
+  document.getElementById('result-title').textContent = '✓ 密钥提取完成';
 };
+
+// ========== Hook Mode ==========
+let hookSse = null;
+const hookSteps = document.querySelectorAll('.hook-step');
+const hookInstruction = document.getElementById('hook-instruction');
+const hookStepsContainer = document.getElementById('hook-steps');
+const progressContainer = document.getElementById('progress-container');
+const resultContainer = document.getElementById('result-container');
+const logConsole = document.getElementById('log-console');
+const progressBar = document.getElementById('progress-bar');
+const progressDetail = document.getElementById('progress-detail');
+const resultTitle = document.getElementById('result-title');
+const resultContent = document.getElementById('result-content');
+
+const STEP_LABELS = {
+  check: '检查环境',
+  wait_exit: '退出微信',
+  wait_login: '重新登录',
+  install: '安装Hook',
+  polling: '捕获密钥'
+};
+
+const INSTRUCTIONS = {
+  check: '正在检查运行环境和准备工作...',
+  wait_exit: '<strong style="color:#f0c040">⚠ 请操作：</strong>右键点击系统托盘中的 <strong>微信图标</strong> &rarr; 选择 <strong>"退出微信"</strong><br><small style="color:#8b949e">微信需要回到登录界面才能触发数据库初始化</small>',
+  wait_login: '<strong style="color:#58a6ff">🔐 请操作：</strong>打开微信，在登录界面点击 <strong>"登录"</strong> 按钮<br><small style="color:#8b949e">Hook将在登录过程中拦截所有数据库密钥</small>',
+  install: '检测到微信进程，正在安装DLL注入Hook...',
+  polling: 'Hook已就位，正在捕获密钥...<br><small style="color:#8b949e">请确保在Hook安装完成后再点击登录</small>'
+};
+
+function setActiveStep(stage) {
+  hookSteps.forEach(el => {
+    const dot = el.querySelector('.step-dot');
+    const stepName = el.dataset.step;
+    if (stepName === stage) {
+      dot.textContent = '●';
+      dot.style.color = '#58a6ff';
+      el.style.color = '#58a6ff';
+      el.style.fontWeight = 'bold';
+    } else if (isStepDone(stepName, stage)) {
+      dot.textContent = '✓';
+      dot.style.color = '#3fb950';
+      el.style.color = '#3fb950';
+      el.style.fontWeight = 'normal';
+    } else {
+      dot.textContent = '○';
+      dot.style.color = '#484f58';
+      el.style.color = '#8b949e';
+      el.style.fontWeight = 'normal';
+    }
+  });
+}
+
+function isStepDone(stepName, currentStage) {
+  const order = ['check', 'wait_exit', 'wait_login', 'install', 'polling'];
+  return order.indexOf(stepName) < order.indexOf(currentStage);
+}
+
+function setInstruction(stage, detail) {
+  if (detail) {
+    hookInstruction.innerHTML = detail;
+  } else if (INSTRUCTIONS[stage]) {
+    hookInstruction.innerHTML = INSTRUCTIONS[stage];
+  }
+}
+
+function appendLog(msg, cls) {
+  const div = document.createElement('div');
+  div.className = 'log-line ' + (cls || '');
+  div.textContent = msg;
+  logConsole.appendChild(div);
+  logConsole.scrollTop = logConsole.scrollHeight;
+}
+
+document.getElementById('btn-run-hook').addEventListener('click', function() {
+  this.disabled = true;
+  document.getElementById('tab-memory').disabled = true;
+
+  hookStepsContainer.style.display = 'block';
+  progressContainer.style.display = 'block';
+  resultContainer.style.display = 'none';
+  logConsole.innerHTML = '';
+  progressBar.style.width = '0%';
+  resultContent.innerHTML = '';
+
+  // Reset step indicators
+  hookSteps.forEach(el => {
+    const dot = el.querySelector('.step-dot');
+    dot.textContent = '○';
+    dot.style.color = '#484f58';
+    el.style.color = '#8b949e';
+    el.style.fontWeight = 'normal';
+  });
+
+  setActiveStep('check');
+  setInstruction('check');
+
+  hookSse = new SseProgress('/api/backup/hook-keyscan', {
+    method: 'POST',
+    body: {},
+    onProgress: function(data) {
+      const stage = data.stage || 'polling';
+      const detail = data.detail || '';
+      const progress = data.progress || 0;
+
+      progressBar.style.width = (progress * 100).toFixed(0) + '%';
+      progressDetail.textContent = detail;
+
+      setActiveStep(stage);
+      setInstruction(stage, detail);
+
+      if (detail) {
+        appendLog(detail, stage === 'error' ? 'error' : 'ok');
+      }
+    },
+    onDone: function(data) {
+      const result = data.result || data;
+      setActiveStep('polling');
+
+      resultContainer.style.display = 'block';
+      progressBar.style.width = '100%';
+      progressDetail.textContent = result.keys > 0
+        ? '✓ 捕获 ' + result.keys + '/' + result.total + ' 个密钥'
+        : '未捕获到密钥';
+
+      if (result.keys > 0) {
+        resultTitle.textContent = '✓ 密钥提取完成';
+        let html = '<dl class="result-stats">';
+        html += '<dt>发现密钥</dt><dd>' + result.keys + '/' + result.total + ' 个</dd>';
+        html += '</dl>';
+        if (result.output) {
+          html += '<pre style="font-size:11px;background:#0d1117;padding:8px;border-radius:4px;max-height:200px;overflow:auto;margin-top:8px">' + escapeHtml(result.output) + '</pre>';
+        }
+        resultContent.innerHTML = html;
+      } else {
+        resultTitle.textContent = '⚠ 密钥提取未成功';
+        resultContent.innerHTML = '<p style="color:#d29922">Hook安装成功但未拦截到密钥调用。可能原因：</p>' +
+          '<ul style="color:#8b949e;font-size:13px">' +
+          '<li>微信在Hook安装前已经完成了数据库初始化</li>' +
+          '<li>请重试：确保在"等待登录"提示出现后再点击微信登录按钮</li>' +
+          '</ul>' +
+          '<pre style="font-size:11px;background:#0d1117;padding:8px;border-radius:4px;max-height:200px;overflow:auto;margin-top:8px">' + escapeHtml(result.output || '') + '</pre>';
+      }
+
+      document.getElementById('btn-run-hook').disabled = false;
+      document.getElementById('tab-memory').disabled = false;
+      appendLog(result.keys > 0 ? '✓ 操作完成' : '⚠ 操作完成(未捕获密钥)', result.keys > 0 ? 'ok' : 'error');
+    },
+    onError: function(err) {
+      setActiveStep('check');
+      hookInstruction.innerHTML = '<strong style="color:#e94560">✗ 错误：</strong>' + escapeHtml(err.message);
+      appendLog('✗ ' + err.message, 'error');
+      document.getElementById('btn-run-hook').disabled = false;
+      document.getElementById('tab-memory').disabled = false;
+    }
+  });
+  hookSse.start();
+});
+
+// Tab switching
+document.getElementById('tab-memory').addEventListener('click', function() {
+  this.classList.add('btn-primary');
+  document.getElementById('tab-hook').classList.remove('btn-primary');
+  document.getElementById('panel-memory').style.display = 'block';
+  document.getElementById('panel-hook').style.display = 'none';
+  hookStepsContainer.style.display = 'none';
+  progressContainer.style.display = 'none';
+  resultContainer.style.display = 'none';
+  if (hookSse) hookSse.stop();
+});
+
+document.getElementById('tab-hook').addEventListener('click', function() {
+  this.classList.add('btn-primary');
+  document.getElementById('tab-memory').classList.remove('btn-primary');
+  document.getElementById('panel-memory').style.display = 'none';
+  document.getElementById('panel-hook').style.display = 'block';
+  progressContainer.style.display = 'none';
+  resultContainer.style.display = 'none';
+  if (hookSse) hookSse.stop();
+});
 </script>
 {% endblock %}

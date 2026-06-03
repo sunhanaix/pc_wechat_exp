@@ -1,7 +1,9 @@
 """Backup API — SSE-streaming endpoints for backup, key scan, and decrypt."""
 import os
 import sys
+import ctypes
 import threading
+import time as _time
 from flask import Blueprint, request, current_app
 
 _BASE = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -233,6 +235,172 @@ def backup_decrypt():
                         'skipped_missing_key': skipped_keys})
         except Exception as e:
             push.error(str(e))
+
+    threading.Thread(target=_run, daemon=True).start()
+    return sse_response(gen)
+
+
+@backup_bp.route('/hook-keyscan', methods=['POST'])
+def backup_hook_keyscan():
+    """POST /api/backup/hook-keyscan — Interactive hook-based key extraction.
+
+    Guides the user through: exit WeChat → login → intercept sqlite3_key()
+    calls during database initialization. Uses SSE for real-time status.
+    """
+    data = request.get_json(silent=True) or {}
+    db_dir = data.get('db_dir') or current_app.config.get('DB_DIR')
+    if not db_dir:
+        try:
+            from engine.utils import find_all_wechat_data_dirs
+            dirs = find_all_wechat_data_dirs()
+            if dirs:
+                db_dir = dirs[0]['db_path']
+        except Exception:
+            pass
+    if not db_dir or not os.path.isdir(db_dir):
+        push, gen = create_sse_progress()
+        push.error("未找到微信数据目录")
+        return sse_response(gen)
+
+    push, gen = create_sse_progress()
+
+    def _run():
+        try:
+            # --- Check prerequisites ---
+            push('check', '正在检查运行环境...', 0.05)
+
+            # Admin check
+            try:
+                is_admin = ctypes.windll.shell32.IsUserAnAdmin() != 0
+            except Exception:
+                is_admin = False
+            if not is_admin:
+                push.error("需要以管理员身份运行才能使用Hook模式")
+                return
+
+            # py_wx_key check
+            try:
+                import wx_key
+            except ImportError:
+                push.error("py_wx_key 模块未安装，无法使用Hook模式")
+                return
+
+            # psutil check
+            try:
+                import psutil
+            except ImportError:
+                push.error("psutil 模块未安装")
+                return
+
+            # Collect DB info
+            from key_scan import collect_db_files, _find_wechat_pids, _try_hook_on_pid
+            push('check', '正在收集数据库信息...', 0.08)
+            db_files, salt_to_dbs = collect_db_files(db_dir)
+            total_salts = len(salt_to_dbs)
+            push('check', f'找到 {len(db_files)} 个数据库, {total_salts} 个不同密钥', 0.10)
+
+            key_map = {}
+
+            # --- Phase 1: Check if WeChat is already running ---
+            candidates = _find_wechat_pids()
+            if candidates:
+                largest_pid = candidates[0][1]
+                largest_mem = candidates[0][0] // 1048576
+                push('wait_exit',
+                     f'检测到微信正在运行 (PID={largest_pid}, {largest_mem}MB)。'
+                     '请完全退出微信：右键点击系统托盘中的微信图标 → 退出微信',
+                     0.15)
+                push('wait_exit',
+                     '等待微信退出...',
+                     0.18)
+
+                # Wait for all weixin.exe processes to exit
+                wait_start = _time.time()
+                while _time.time() - wait_start < 120:
+                    current = _find_wechat_pids()
+                    if not current:
+                        break
+                    _time.sleep(1)
+                else:
+                    push.error("等待微信退出超时(120秒)，请手动关闭后重试")
+                    return
+
+            # --- Phase 2: Wait for WeChat to restart ---
+            push('wait_login',
+                 '微信已退出。现在请打开微信，在登录界面点击"登录"按钮',
+                 0.25)
+            push('wait_login',
+                 '等待微信进程启动...',
+                 0.28)
+
+            # Wait for new WeChat process
+            wait_start = _time.time()
+            new_pid = None
+            new_mem = 0
+            while _time.time() - wait_start < 120:
+                current = _find_wechat_pids()
+                if current:
+                    # Give WeChat 2s to finish spawning all processes,
+                    # then pick the largest (main UI process)
+                    _time.sleep(2)
+                    current = _find_wechat_pids()
+                    if current:
+                        new_pid = current[0][1]
+                        new_mem = current[0][0] // 1048576
+                    break
+                _time.sleep(1)
+            else:
+                push.error("等待微信启动超时(120秒)，请手动启动微信后重试")
+                return
+
+            push('install',
+                 f'检测到微信进程 PID={new_pid} ({new_mem}MB)，正在安装Hook...',
+                 0.40)
+
+            # --- Phase 3: Install hook and poll for keys ---
+            # Wrap push as a print_fn for _try_hook_on_pid
+            def _hook_print(msg):
+                push('polling', msg, 0.50)
+
+            found = _try_hook_on_pid(
+                new_pid, db_files, salt_to_dbs, key_map,
+                print_fn=_hook_print, timeout=60
+            )
+
+            # --- Phase 4: Results ---
+            if key_map:
+                # Save keys to config
+                from engine.config_file import set_db_keys as _set_db_keys
+                db_keys = {}
+                for salt_hex, key_hex in key_map.items():
+                    for rel_path in salt_to_dbs.get(salt_hex, []):
+                        db_keys[rel_path] = key_hex
+                try:
+                    _set_db_keys(db_keys, db_dir)
+                except Exception:
+                    pass
+
+                push('done', f'成功捕获 {len(key_map)}/{total_salts} 个密钥', 1.0)
+                push.done({
+                    'keys': len(key_map),
+                    'total': total_salts,
+                    'found': list(key_map.keys()),
+                    'output': '\n'.join(
+                        f'[OK] {salt} → {", ".join(salt_to_dbs[salt])}'
+                        for salt in key_map
+                    )
+                })
+            else:
+                push.done({
+                    'keys': 0,
+                    'total': total_salts,
+                    'output': 'Hook已安装但未拦截到 sqlite3_key() 调用。'
+                              '请确保微信在Hook安装后才点击登录，重新尝试。'
+                })
+
+        except Exception as e:
+            import traceback
+            push.error(f'{e}\n{traceback.format_exc()}')
 
     threading.Thread(target=_run, daemon=True).start()
     return sse_response(gen)
