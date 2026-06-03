@@ -334,77 +334,84 @@ def _extract_keys_via_hook(db_dir, db_files, salt_to_dbs, key_map, print_fn, tim
         print_fn("[Hook] Not running as admin — skipping hook extraction")
         return
 
-    # Find WeChat PID via psutil
+    # Find WeChat PID via psutil — use largest memory process (main proc)
     try:
         import psutil
     except ImportError:
         print_fn("[Hook] psutil not installed — skipping hook extraction")
         return
 
-    pid = None
-    for proc in psutil.process_iter(['pid', 'name']):
+    candidates = []
+    for proc in psutil.process_iter(['pid', 'name', 'memory_info']):
         try:
-            if proc.info['name'] and proc.info['name'].lower() == 'weixin.exe':
-                pid = proc.info['pid']
-                break
+            info = proc.info
+            if info['name'] and info['name'].lower() == 'weixin.exe':
+                mem = info['memory_info'].rss if info['memory_info'] else 0
+                candidates.append((mem, info['pid']))
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue
 
-    if not pid:
+    if not candidates:
         print_fn("[Hook] Weixin.exe not running — skipping hook extraction")
         return
 
-    print_fn(f"[Hook] Weixin.exe PID={pid}, installing hook...")
+    # Pick the largest — that's the main UI process with DB connections
+    candidates.sort(reverse=True)
+    print_fn(f"[Hook] Weixin.exe PIDs found: {[p for _,p in candidates]}")
 
-    # Build salt -> page1 lookup for remaining salts
-    remaining_salts = set(salt_to_dbs.keys()) - set(key_map.keys())
-    if not remaining_salts:
-        print_fn("[Hook] All keys already found — skipping hook")
-        return
+    # Try each candidate in descending size order
+    for mem_size, pid in candidates:
+        print_fn(f"[Hook] Trying PID={pid} ({mem_size//1048576}MB)...")
 
-    salt_to_page1 = {}
-    for rel, path, sz, salt_hex, page1 in db_files:
-        if salt_hex in remaining_salts:
-            salt_to_page1[salt_hex] = page1
+        # Build salt -> page1 lookup for remaining salts
+        remaining_salts = set(salt_to_dbs.keys()) - set(key_map.keys())
+        salt_to_page1 = {}
+        for rel, path, sz, salt_hex, page1 in db_files:
+            if salt_hex in remaining_salts:
+                salt_to_page1[salt_hex] = page1
 
-    # Install hook
-    if not wx_key.initialize_hook(pid):
-        print_fn(f"[Hook] Init failed: {wx_key.get_last_error_msg()}")
-        return
-    print_fn("[Hook] Hook installed, polling for keys...")
+        # Install hook
+        if not wx_key.initialize_hook(pid):
+            err = wx_key.get_last_error_msg()
+            print_fn(f"[Hook] PID={pid} init failed: {err}")
+            continue
+        print_fn("[Hook] Hook installed, polling for keys...")
 
-    try:
-        import time as _time
-        start = _time.time()
-        found_count = 0
-        while _time.time() - start < timeout:
-            res = wx_key.poll_key_data()
-            if res and 'key' in res:
-                key_hex = res['key'].lower()
-                if len(key_hex) != 64:
-                    continue
-                key_bytes = bytes.fromhex(key_hex)
+        try:
+            import time as _time
+            start = _time.time()
+            found_count = 0
+            while _time.time() - start < timeout:
+                res = wx_key.poll_key_data()
+                if res and 'key' in res:
+                    key_hex = res['key'].lower()
+                    if len(key_hex) != 64:
+                        continue
+                    key_bytes = bytes.fromhex(key_hex)
 
-                # Verify against all remaining salts
-                for salt_hex, page1 in list(salt_to_page1.items()):
-                    if verify_enc_key(key_bytes, page1):
-                        key_map[salt_hex] = key_hex
-                        found_count += 1
-                        print_fn(f"  [Hook-FOUND] salt={salt_hex} DBs={salt_to_dbs[salt_hex]}")
-                        del salt_to_page1[salt_hex]
+                    # Verify against all remaining salts
+                    for salt_hex, page1 in list(salt_to_page1.items()):
+                        if verify_enc_key(key_bytes, page1):
+                            key_map[salt_hex] = key_hex
+                            found_count += 1
+                            print_fn(f"  [Hook-FOUND] salt={salt_hex} DBs={salt_to_dbs[salt_hex]}")
+                            del salt_to_page1[salt_hex]
 
-                        if len(key_map) >= len(salt_to_dbs):
-                            break
+                            if len(key_map) >= len(salt_to_dbs):
+                                break
 
-                if len(key_map) >= len(salt_to_dbs):
-                    break
+                    if len(key_map) >= len(salt_to_dbs):
+                        break
 
-            _time.sleep(0.1)
+                _time.sleep(0.1)
 
-        print_fn(f"[Hook] Captured {found_count} keys in {_time.time() - start:.1f}s")
-    finally:
-        wx_key.cleanup_hook()
-        print_fn("[Hook] Hook cleaned up")
+            print_fn(f"[Hook] Captured {found_count} keys in {_time.time() - start:.1f}s")
+        finally:
+            wx_key.cleanup_hook()
+            print_fn("[Hook] Hook cleaned up")
+
+        if found_count > 0:
+            break  # Success, don't try other PIDs
 
 
 def collect_db_files(db_dir):
