@@ -125,7 +125,19 @@ def select_shards(encrypted_msg_dir, manifest, date_from, date_to, margin_days=1
     if not present:
         return []
 
-    selected = {present[0]}                       # newest shard always needed
+    selected = set()
+    newest = present[0]
+    # Newest shard is included when the report's end is at/after its known start
+    # (its manifest end may be stale — WeChat keeps writing to it), or when it
+    # is unknown and must be scanned. Purely historical ranges skip it.
+    newest_entry = manifest.get(newest)
+    if newest_entry:
+        newest_start = date.fromisoformat(newest_entry['start'])
+        if date_to >= newest_start - timedelta(days=margin_days):
+            selected.add(newest)
+    else:
+        selected.add(newest)
+
     for f in present:
         entry = manifest.get(f)
         if entry and _overlaps(entry, date_from, date_to, margin_days):

@@ -60,3 +60,19 @@ def test_select_shards_backfills_unknown_when_coverage_missing(tmp_path):
     sel = ss.select_shards(str(enc), manifest, date(2026, 1, 1), date(2026, 8, 23))
     assert 'message_1.db' in sel
     assert 'message_0.db' in sel   # 新增未知分片，供回填扫描
+
+
+def test_select_shards_skips_newest_for_historical_range(tmp_path):
+    enc = tmp_path / 'enc' / 'message'
+    _touch(str(enc), 'message_6.db', 3000)   # newest (2026)
+    _touch(str(enc), 'message_5.db', 2000)
+    _touch(str(enc), 'message_4.db', 1000)
+    manifest = {
+        'message_6.db': {'start': '2026-06-30', 'end': '2026-08-23'},
+        'message_5.db': {'start': '2020-07-17', 'end': '2021-07-01'},
+        'message_4.db': {'start': '2021-07-01', 'end': '2022-07-01'},
+    }
+    sel = ss.select_shards(str(enc), manifest, date(2021, 1, 1), date(2021, 12, 31))
+    assert 'message_6.db' not in sel   # 纯历史区间不需要最新分片
+    assert 'message_5.db' in sel
+    assert 'message_4.db' in sel
