@@ -147,7 +147,8 @@ def decrypt_database(db_path, out_path, enc_key, print_fn=None, progress_fn=None
                 pass
 
 
-def run_decrypt(keys_file=None, db_dir=None, out_dir=None, print_fn=None, progress_fn=None):
+def run_decrypt(keys_file=None, db_dir=None, out_dir=None, print_fn=None,
+                progress_fn=None, only_rel_paths=None):
     """主入口：批量解密所有数据库。
     Args:
         keys_file: all_keys.json 路径 (None = 从配置文件自动加载)
@@ -155,6 +156,8 @@ def run_decrypt(keys_file=None, db_dir=None, out_dir=None, print_fn=None, progre
         out_dir: 解密输出目录
         print_fn: 日志函数
         progress_fn: 进度回调 (pct, msg)
+        only_rel_paths: 可选 set，元素为相对 db_dir 的路径（如 'message\\message_6.db'）。
+                        非 None 时仅处理命中文件，用于按时间分片精准解密。
     Returns: (success_count, failed_count, skipped_count)
     """
     if print_fn is None:
@@ -210,6 +213,8 @@ def run_decrypt(keys_file=None, db_dir=None, out_dir=None, print_fn=None, progre
     total = len(db_files)
 
     for i, (rel, path, sz) in enumerate(db_files):
+        if only_rel_paths is not None and rel not in only_rel_paths:
+            continue
         pct = 5 + int((i + 1) / total * 90)
         progress_fn(pct, f"解密: {rel}")
 
