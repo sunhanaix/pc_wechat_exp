@@ -133,7 +133,12 @@ def backup_scan():
 
 @backup_bp.route('/keyscan', methods=['POST'])
 def backup_keyscan():
-    """POST /api/backup/keyscan — Extract decryption keys."""
+    """POST /api/backup/keyscan — Extract decryption keys.
+
+    Preferred path: read-only Config.Cipher scan (WeChat 4.1.10+, no admin,
+    no restart, no hook). Falls back to key_scan's full strategy chain only
+    when the read-only scan cannot resolve every salt.
+    """
     data = request.get_json(silent=True) or {}
     db_dir = data.get('db_dir') or current_app.config.get('DB_DIR')
     if not db_dir:
@@ -155,27 +160,68 @@ def backup_keyscan():
         return sse_response(gen)
 
     push, gen = create_sse_progress()
+    flask_app = current_app._get_current_object()
 
     def _run():
+        import io
+        import sys as _sys
         try:
-            from key_scan import run_key_scan
-            push('scan', '正在扫描微信进程内存...', 0.2)
-            import io
+            from engine.services.config_cipher_extract import (
+                extract_keys_via_config_cipher)
+            from engine.services.wechat_key_extract import (
+                collect_db_files, load_from_config, save_key_results)
+
+            push('scan', '正在收集数据库信息...', 0.05)
+            db_files, salt_to_dbs = collect_db_files(db_dir)
+            total = len(salt_to_dbs)
+            push('scan', f'找到 {len(db_files)} 个数据库, {total} 个不同密钥', 0.10)
+
+            key_map = {}
+            # 1) existing config fast path
+            loaded = load_from_config(db_dir, db_files, salt_to_dbs, key_map, print)
+            if loaded == total:
+                push.done({'keys': total, 'total': total,
+                           'source': 'config',
+                           'output': f'所有 {total} 个密钥已存在配置中。'})
+                return
+
+            # 2) read-only Config.Cipher scan (primary for 4.1.10+)
+            push('scan', '开始只读 Config.Cipher 扫描（无需管理员权限，微信保持运行即可）...', 0.15)
             with _stdout_lock:
-                import sys as _sys
                 old_stdout = _sys.stdout
                 _sys.stdout = io.StringIO()
                 try:
-                    run_key_scan(db_dir, None)
+                    found = extract_keys_via_config_cipher(
+                        db_dir, db_files, salt_to_dbs, key_map, print,
+                        lambda pct, msg: push('scan', msg, 0.15 + pct * 0.6))
                     output = _sys.stdout.getvalue()
                 finally:
                     _sys.stdout = old_stdout
 
-            result = {'output': output}
+            # 3) fallback: full key_scan chain (MMKV -> hook -> memscan)
+            if len(key_map) < total:
+                push('scan', f'只读扫描获得 {len(key_map)}/{total}，'
+                             '尝试完整策略链 (MMKV/Hook/内存扫描)...', 0.80)
+                from key_scan import run_key_scan
+                with _stdout_lock:
+                    old_stdout = _sys.stdout
+                    _sys.stdout = io.StringIO()
+                    try:
+                        run_key_scan(db_dir, None)
+                        output += '\n' + _sys.stdout.getvalue()
+                    finally:
+                        _sys.stdout = old_stdout
+
+            # 4) persist any newly found keys
+            if key_map:
+                save_key_results(db_files, salt_to_dbs, key_map, db_dir, print)
+
             from engine.config_file import get_db_keys
             keys = get_db_keys()
-            if keys:
-                result['keys'] = len(keys)
+            result = {'keys': len(keys) if keys else len(key_map),
+                      'total': total,
+                      'source': 'config-cipher' if len(key_map) >= total else 'mixed',
+                      'output': output}
             push.done(result)
         except Exception as e:
             push.error(str(e))
@@ -278,12 +324,15 @@ def backup_hook_keyscan():
                 push.error("需要以管理员身份运行才能使用Hook模式")
                 return
 
-            # py_wx_key check
+            # py_wx_key check — prefer v2 (built-in, 4-param corrected), fall back to wx_key
             try:
-                import wx_key
+                from engine.services.py_wx_key_v2 import initialize_hook
             except ImportError:
-                push.error("py_wx_key 模块未安装，无法使用Hook模式")
-                return
+                try:
+                    import wx_key
+                except ImportError:
+                    push.error("py_wx_key 模块未安装，无法使用Hook模式")
+                    return
 
             # psutil check
             try:

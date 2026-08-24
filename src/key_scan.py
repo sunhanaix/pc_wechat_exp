@@ -329,9 +329,28 @@ def _find_wechat_pids():
     return candidates
 
 
-def _try_hook_on_pid(pid, db_files, salt_to_dbs, key_map, print_fn, timeout=30):
-    """Install hook on a single PID and poll for keys. Returns count found."""
-    import wx_key
+def _try_hook_on_pid(pid, db_files, salt_to_dbs, key_map, print_fn, timeout=30, use_v2=True):
+    """Install hook on a single PID and poll for keys. Returns count found.
+
+    Hook backend preference: py_wx_key_v3 (entry hook, version-tolerant)
+    > py_wx_key_v2 (wrapper+0x989, 4.1.10.x) > legacy wx_key module.
+    """
+
+    hook_mod = None
+    hook_name = None
+    if use_v2:
+        for name in ('py_wx_key_v3', 'py_wx_key_v2'):
+            try:
+                hook_mod = __import__(f'engine.services.{name}', fromlist=['initialize_hook'])
+                hook_name = name.replace('py_wx_key_', '')
+                break
+            except ImportError:
+                continue
+        if hook_mod is None:
+            use_v2 = False
+
+    if not use_v2:
+        import wx_key
 
     remaining_salts = set(salt_to_dbs.keys()) - set(key_map.keys())
     if not remaining_salts:
@@ -342,23 +361,31 @@ def _try_hook_on_pid(pid, db_files, salt_to_dbs, key_map, print_fn, timeout=30):
         if salt_hex in remaining_salts:
             salt_to_page1[salt_hex] = page1
 
-    # Flush any stale status messages before init
-    msg, level = wx_key.get_status_message()
-    while msg:
+    # Flush any stale status messages before init (wx_key only)
+    if not use_v2:
         msg, level = wx_key.get_status_message()
+        while msg:
+            msg, level = wx_key.get_status_message()
 
-    if not wx_key.initialize_hook(pid):
-        err = wx_key.get_last_error_msg()
-        print_fn(f"[Hook] PID={pid} init failed: {err}")
-        return 0
-
-    # Print status messages from C++ side during init
-    msg, level = wx_key.get_status_message()
-    while msg:
-        print_fn(f"[Hook:status] {msg}")
+    if use_v2:
+        if not hook_mod.initialize_hook(pid):
+            err = hook_mod.get_last_error_msg()
+            print_fn(f"[Hook:{hook_name}] PID={pid} init failed: {err}")
+            return 0
+        print_fn(f"[Hook:{hook_name}] PID={pid} — polling for key setup calls...")
+        print_fn(f"[Hook:{hook_name}] {hook_mod.get_last_error_msg()}")
+    else:
+        if not wx_key.initialize_hook(pid):
+            err = wx_key.get_last_error_msg()
+            print_fn(f"[Hook] PID={pid} init failed: {err}")
+            return 0
+        # Print status messages from C++ side during init
         msg, level = wx_key.get_status_message()
+        while msg:
+            print_fn(f"[Hook:status] {msg}")
+            msg, level = wx_key.get_status_message()
+        print_fn(f"[Hook] PID={pid} — polling for sqlite3_key() calls...")
 
-    print_fn(f"[Hook] PID={pid} — polling for sqlite3_key() calls...")
     print_fn("[Hook] TIP: Navigate WeChat (open chats, Moments, Favorites, Stickers)")
 
     try:
@@ -370,14 +397,18 @@ def _try_hook_on_pid(pid, db_files, salt_to_dbs, key_map, print_fn, timeout=30):
         _first_key_logged = False
         seen_keys = set()  # deduplicate captured keys
         while _time.time() - start < timeout:
-            # Drain status messages from C++ side
-            msg, level = wx_key.get_status_message()
-            while msg:
-                if level >= 1:
-                    print_fn(f"[Hook:diag] {msg}")
+            # Drain status messages (wx_key only)
+            if not use_v2:
                 msg, level = wx_key.get_status_message()
+                while msg:
+                    if level >= 1:
+                        print_fn(f"[Hook:diag] {msg}")
+                    msg, level = wx_key.get_status_message()
 
-            res = wx_key.poll_key_data()
+            if use_v2:
+                res = hook_mod.poll_key_data()
+            else:
+                res = wx_key.poll_key_data()
             if res and 'key' in res:
                 key_hex = res['key'].lower()
                 if len(key_hex) == 64 and key_hex not in seen_keys:
@@ -415,11 +446,14 @@ def _try_hook_on_pid(pid, db_files, salt_to_dbs, key_map, print_fn, timeout=30):
                  f" ({unverified_count} unverified, {len(seen_keys)} unique captures)")
         return found_count
     finally:
-        wx_key.cleanup_hook()
-        # Drain final status messages
-        msg, level = wx_key.get_status_message()
-        while msg:
+        if use_v2:
+            hook_mod.cleanup_hook()
+        else:
+            wx_key.cleanup_hook()
+            # Drain final status messages
             msg, level = wx_key.get_status_message()
+            while msg:
+                msg, level = wx_key.get_status_message()
 
 
 def _extract_keys_via_hook(db_dir, db_files, salt_to_dbs, key_map, print_fn, timeout=30):
@@ -434,11 +468,20 @@ def _extract_keys_via_hook(db_dir, db_files, salt_to_dbs, key_map, print_fn, tim
 
     Returns updated key_map dict (mutated in place for incremental verification).
     """
+    # Prefer py_wx_key_v3/v2 (in-process hook), fall back to wx_key
+    use_v2 = True
     try:
-        import wx_key
+        from engine.services import py_wx_key_v3  # noqa: F401
     except ImportError:
-        print_fn("[Hook] py_wx_key not installed — skipping hook extraction")
-        return
+        try:
+            from engine.services import py_wx_key_v2  # noqa: F401
+        except ImportError:
+            use_v2 = False
+            try:
+                import wx_key  # noqa: F401
+            except ImportError:
+                print_fn("[Hook] No hook backend available — skipping hook extraction")
+                return
 
     is_admin = False
     try:
@@ -457,7 +500,7 @@ def _extract_keys_via_hook(db_dir, db_files, salt_to_dbs, key_map, print_fn, tim
         print_fn(f"[Hook] Weixin.exe PIDs found: {[p for _,p in candidates]}")
         for mem_size, pid in candidates:
             print_fn(f"[Hook] Trying PID={pid} ({mem_size//1048576}MB)...")
-            found = _try_hook_on_pid(pid, db_files, salt_to_dbs, key_map, print_fn, timeout)
+            found = _try_hook_on_pid(pid, db_files, salt_to_dbs, key_map, print_fn, timeout, use_v2=use_v2)
             if found > 0:
                 return
         print_fn("[Hook] No keys captured from running WeChat.")
@@ -497,7 +540,7 @@ def _extract_keys_via_hook(db_dir, db_files, salt_to_dbs, key_map, print_fn, tim
                 if pid in new_pids:
                     print_fn(f"[Hook] New Weixin.exe detected: PID={pid} ({mem_size//1048576}MB)")
                     print_fn("[Hook] Installing hook BEFORE login completes...")
-                    found = _try_hook_on_pid(pid, db_files, salt_to_dbs, key_map, print_fn, timeout=60)
+                    found = _try_hook_on_pid(pid, db_files, salt_to_dbs, key_map, print_fn, timeout=60, use_v2=use_v2)
                     if found > 0:
                         return
                     break
@@ -810,13 +853,36 @@ def run_key_scan(db_dir, out_file, print_fn=None, progress_fn=None):
     key_map = {}
     t0 = time.time()
 
+    # Strategy 0: 从已有配置文件加载 (最快的路径)
+    from engine.services.wechat_key_extract import load_from_config
+    loaded = load_from_config(db_dir, db_files, salt_to_dbs, key_map, print_fn)
+    if loaded == len(salt_to_dbs):
+        print_fn("[Config] 所有密钥已从配置文件中加载 — 跳过扫描")
+        save_results(db_files, salt_to_dbs, key_map, db_dir, out_file, print_fn)
+        return key_map
+    elif loaded > 0:
+        print_fn(f"[Config] 已加载 {loaded} 个密钥, 仍需提取 {len(salt_to_dbs) - loaded} 个")
+
     # Strategy 1: MMKV 离线提取 (新版本)
     mmkv_keys = _extract_keys_from_mmkv(db_dir, db_files, salt_to_dbs, print_fn)
     if mmkv_keys:
         key_map.update(mmkv_keys)
         print_fn(f"[MMKV] {len(mmkv_keys)} 个密钥从 MMKV 配置文件提取")
 
-    # Strategy 2: py_wx_key API Hook (注入拦截 sqlite3_key)
+    # Strategy 2: Config.Cipher 只读扫描 (微信 4.1.10+, 无需管理员权限)
+    remaining_salts = set(salt_to_dbs.keys()) - set(key_map.keys())
+    if remaining_salts:
+        print_fn(f"[*] 尝试 Config.Cipher 只读扫描 (剩余 {len(remaining_salts)} 个 salt)...")
+        print_fn("[*] 提示: 请确保微信已启动并登录。本扫描为只读，无需管理员权限。")
+        try:
+            from engine.services.config_cipher_extract import extract_keys_via_config_cipher
+            found = extract_keys_via_config_cipher(
+                db_dir, db_files, salt_to_dbs, key_map, print_fn, progress_fn)
+            print_fn(f"[Cipher] {found} 个密钥通过 Config.Cipher 只读扫描提取")
+        except Exception as e:
+            print_fn(f"[Cipher] 扫描出错: {e}")
+
+    # Strategy 3: py_wx_key API Hook (注入拦截 sqlite3_key)
     remaining_salts = set(salt_to_dbs.keys()) - set(key_map.keys())
     if remaining_salts:
         _extract_keys_via_hook(db_dir, db_files, salt_to_dbs, key_map, print_fn)

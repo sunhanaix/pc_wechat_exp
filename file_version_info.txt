@@ -1,8 +1,8 @@
 # UTF-8
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(2, 3, 2026, 601),
-    prodvers=(2, 3, 2026, 601),
+    filevers=(2, 3, 2026, 824),
+    prodvers=(2, 3, 2026, 824),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -16,12 +16,12 @@ VSVersionInfo(
         '040904b0',
         [StringStruct('CompanyName', ''),
          StringStruct('FileDescription', 'WeChat EXP'),
-         StringStruct('FileVersion', '2.3.20260601'),
+         StringStruct('FileVersion', '2.3.20260824'),
          StringStruct('InternalName', 'wechat_exp'),
          StringStruct('LegalCopyright', ''),
          StringStruct('OriginalFilename', 'wechat_exp.exe'),
          StringStruct('ProductName', 'WeChat EXP'),
-         StringStruct('ProductVersion', '2.3.20260601')])
+         StringStruct('ProductVersion', '2.3.20260824')])
     ]),
     VarFileInfo([VarStruct('Translation', [0x409, 1200])])
   ]

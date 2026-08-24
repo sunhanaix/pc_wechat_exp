@@ -1,7 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
 from PyInstaller.utils.hooks import collect_all
 
-datas = [('src', 'src'), ('tools\\silk_decoder.exe', 'tools'), ('tools\\silk_decoder.c', 'tools')]
+datas = [('src', 'src'), ('tools/silk_decoder.exe', 'tools'), ('tools/silk_decoder.c', 'tools')]
 binaries = []
 hiddenimports = ['Crypto.Cipher.AES', 'Crypto.Util.Padding', 'flask', 'werkzeug', 'jinja2', 'blackboxprotobuf', 'zstandard', 'openpyxl', 'jieba', 'jieba.posseg', 'requests', 'pypinyin']
 tmp_ret = collect_all('jieba')
@@ -9,7 +9,7 @@ datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 
 a = Analysis(
-    ['d:\\perl_wrk\\pc_wechat_exp_sync\\src\\main.py'],
+    ['src/main.py'],
     pathex=[],
     binaries=binaries,
     datas=datas,
@@ -42,5 +42,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    version='d:\\perl_wrk\\pc_wechat_exp_sync\\file_version_info.txt',
+    version='file_version_info.txt',
 )

@@ -196,8 +196,23 @@ def cmd_export(args):
         list_chats()
     elif mode == 'keys':
         from key_scan import run_key_scan
+        from engine.utils import is_wechat_running
         db_dir = args.db_dir or _resolve_db_dir()
         out_file = None  # keys are saved to .wechat_exp_config.json by default
+        if not db_dir:
+            print("错误: 未找到微信数据目录。请先登录微信，或使用 --db-dir 指定 db_storage 路径")
+            return
+        print("=" * 56)
+        print("  密钥提取")
+        print("=" * 56)
+        if not is_wechat_running():
+            print("提示: 当前未检测到微信进程。")
+            print("      请先启动微信并登录，然后重新运行本命令。")
+            print("      提取密钥只需要微信保持运行，无需管理员权限。")
+            print()
+        else:
+            print("已检测到微信运行中 — 开始只读提取密钥...")
+            print()
         run_key_scan(db_dir, out_file)
     elif mode == 'decrypt':
         from engine.decrypt import run_decrypt

@@ -8,20 +8,26 @@
 <div class="config-panel">
   <!-- Mode selector -->
   <div class="mode-tabs" style="display:flex;gap:8px;margin-bottom:16px">
-    <button id="tab-memory" class="btn btn-primary" style="font-size:13px">内存扫描</button>
-    <button id="tab-hook" class="btn" style="font-size:13px">⚡ Hook拦截 <span style="font-size:10px;opacity:0.7">(推荐 4.1.10+)</span></button>
+    <button id="tab-memory" class="btn btn-primary" style="font-size:13px">⭐ 一键提取 <span style="font-size:10px;opacity:0.7">(推荐)</span></button>
+    <button id="tab-hook" class="btn" style="font-size:13px">⚡ Hook拦截 <span style="font-size:10px;opacity:0.7">(备用 需管理员)</span></button>
   </div>
 
-  <!-- Memory scan panel -->
+  <!-- Read-only scan panel (default) -->
   <div id="panel-memory">
-    <p style="font-size:11px;color:#d29922;margin:0 0 12px 0">⚠ 从微信进程内存中搜索密钥。微信需保持运行。4.1.10+ 版本可能失效。</p>
-    <button id="btn-run-memory" class="btn btn-primary">开始内存扫描</button>
+    <div style="background:#11263a;border:1px solid #1f4d73;border-radius:8px;padding:12px 14px;margin-bottom:12px;font-size:13px;line-height:1.7">
+      <strong style="color:#58a6ff">使用方法（无需管理员权限）：</strong><br>
+      ① 请确保微信 <strong>已启动并登录</strong>（保持运行，不用退出）<br>
+      ② 点击下方按钮，程序会只读扫描微信进程中的密钥对象<br>
+      ③ 扫描结果自动保存，随后即可解密数据库
+    </div>
+    <button id="btn-run-memory" class="btn btn-primary" style="font-size:14px;padding:8px 20px">🔑 开始提取密钥</button>
+    <p style="font-size:11px;color:#8b949e;margin:8px 0 0 0">基于 WCDB Config.Cipher 只读扫描（微信 4.1.10+），无需管理员、无需重启微信。</p>
   </div>
 
-  <!-- Hook panel -->
+  <!-- Hook panel (fallback) -->
   <div id="panel-hook" style="display:none">
-    <p style="font-size:11px;color:#58a6ff;margin:0 0 12px 0">💡 通过 DLL 注入拦截 <code>sqlite3_key()</code> 调用，在微信登录过程中捕获密钥。需要管理员权限。</p>
-    <button id="btn-run-hook" class="btn btn-primary">开始 Hook 提取</button>
+    <p style="font-size:11px;color:#d29922;margin:0 0 12px 0">⚠ 备用方案：通过 DLL 注入拦截 <code>sqlite3_key()</code> 调用，在微信登录过程中捕获密钥。需要管理员权限，且需要退出/重启微信。</p>
+    <button id="btn-run-hook" class="btn btn-primary">开始 Hook 提取（备用）</button>
   </div>
 </div>
 
@@ -86,7 +92,8 @@ const memoryPage = new WizardPage({
 memoryPage.showResult = function(result) {
   WizardPage.prototype.showResult.call(this, result);
   let html = '<dl class="result-stats">';
-  if (result.keys !== undefined) html += '<dt>发现密钥</dt><dd>' + result.keys + ' 个</dd>';
+  if (result.keys !== undefined) html += '<dt>发现密钥</dt><dd>' + result.keys + (result.total ? '/' + result.total : '') + ' 个</dd>';
+  if (result.source) html += '<dt>来源</dt><dd>' + (result.source === 'config' ? '已有配置' : result.source === 'config-cipher' ? 'Config.Cipher 只读扫描' : '混合策略') + '</dd>';
   if (result.file) html += '<dt>保存位置</dt><dd><code>' + result.file + '</code></dd>';
   html += '</dl>';
   if (result.output) {

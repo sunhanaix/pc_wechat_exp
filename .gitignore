@@ -20,3 +20,16 @@ output/
 README-52.md
 .gitignore
 .claude/
+# --- Sensitive / local-only (never commit) ---
+.wechat_exp_config.json.*
+*.json.ok
+HANDOFF.md
+.tmp/
+build_log.txt
+build_nopause.bat
+exe_*.txt
+output/exe_test_config_backup.json
+tools/re/
+claude_kimi_ds.bat
+extract_keys.py
+gitignore_diff.txt
