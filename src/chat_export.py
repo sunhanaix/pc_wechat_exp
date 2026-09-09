@@ -41,6 +41,45 @@ def _extract_own_wxid(tables: list) -> str:
     return ""
 
 
+def _resolve_sender_any(uid, contact_db_path):
+    """Resolve a username/wxid to its display name from contact.db.
+
+    Handles the WeChat 4.x account-suffix case (message DB stores wxid_xxx
+    while contact.db keys the row as wxid_xxx_10e8) and prefers remark over
+    nick over alias, mirroring engine/services/name_resolver.pick_display_name.
+    Returns the original uid when nothing usable is found.
+    """
+    if not uid or not contact_db_path or not os.path.isfile(contact_db_path):
+        return uid
+    try:
+        conn = sqlite3.connect(f'file:{contact_db_path}?mode=ro', uri=True)
+        row = conn.execute(
+            "SELECT remark, nick_name, alias, username FROM contact WHERE username=?",
+            (uid,)
+        ).fetchone()
+        if not row:
+            # Account-suffix fallback: uid may be the unsuffixed base (wxid_xxx),
+            # while the remark lives on wxid_xxx_10e8.
+            m = re.match(r'^(.+?)_\d{2,}[a-z0-9]*$', uid)
+            base = m.group(1) if m else uid
+            pat = base.replace("_", chr(92) + "_") + chr(92) + "_%"
+            row = conn.execute(
+                "SELECT remark, nick_name, alias, username FROM contact "
+                "WHERE username LIKE ? ESCAPE '\\' LIMIT 1",
+                (pat,)
+            ).fetchone()
+        conn.close()
+        if row:
+            remark, nick, alias, username = [(v or '').strip() for v in row]
+            uname = (username or '').strip()
+            for cand in (remark, nick, alias):
+                if cand and cand != uid and cand != uname:
+                    return cand
+        return uid
+    except (sqlite3.Error, OSError):
+        return uid
+
+
 def export_chat(chat_info, out_dir, start_ts=None, end_ts=None, keyword=None,
                 print_fn=None, progress_fn=None, fmt='txt', display_name=None):
     """导出单个聊天的消息记录。
@@ -151,7 +190,10 @@ def export_chat(chat_info, out_dir, start_ts=None, end_ts=None, keyword=None,
                         if m:
                             base = m.group(1)
                             if base not in sender_map:
-                                sender_map[base] = display
+                                # WeChat 4.x: message DB references the base wxid_xxx,
+                                # map it to THIS contact's own display name (not the
+                                # chat/group display title).
+                                sender_map[base] = contact_display
             conn.close()
         except (sqlite3.Error, OSError):
             pass
@@ -208,13 +250,19 @@ def export_chat(chat_info, out_dir, start_ts=None, end_ts=None, keyword=None,
             if isinstance(content, str) and ":\n" in content[:100]:
                 parts = content.split(":\n", 1)
                 raw_sender = parts[0]
-                sender = _clean_sender_prefix(raw_sender) or raw_sender
+                raw_id = _clean_sender_prefix(raw_sender) or raw_sender
+                # Resolve raw username/wxid to a display name (remark/nick/alias)
+                sender = sender_map.get(raw_id, raw_id)
+                if sender == raw_id and raw_id and not raw_id.startswith('ID:'):
+                    sender = _resolve_sender_any(raw_id, contact_db_path)
             elif base_type in (10000, 10002):
                 sender = "系统消息"
             elif sender_id and sender_id != 0 and sender_id_map:
                 wxid_from_map = sender_id_map.get(int(sender_id))
                 if wxid_from_map and wxid_from_map not in ('__self__', '__other__'):
                     sender = sender_map.get(wxid_from_map, wxid_from_map)
+                    if sender == wxid_from_map:
+                        sender = _resolve_sender_any(wxid_from_map, contact_db_path)
                 else:
                     sender = f"ID:{sender_id}"
             else:
@@ -248,11 +296,17 @@ def export_chat(chat_info, out_dir, start_ts=None, end_ts=None, keyword=None,
                 wxid_from_map = sender_id_map.get(int(sender_id))
                 if wxid_from_map and wxid_from_map not in ('__self__', '__other__'):
                     sender = sender_map.get(wxid_from_map, wxid_from_map)
+                    if sender == wxid_from_map:
+                        sender = _resolve_sender_any(wxid_from_map, contact_db_path)
                 else:
                     # Fallback: use chat_id (the other person's wxid in 1-on-1)
                     sender = sender_map.get(uname, uname)
+                    if uname and sender == uname:
+                        sender = _resolve_sender_any(uname, contact_db_path)
             else:
                 sender = sender_map.get(uname, uname) if uname else (f"ID:{sender_id}" if sender_id else "")
+                if uname and sender == uname:
+                    sender = _resolve_sender_any(uname, contact_db_path)
 
         # Format text content
         text = _format_content(content, base_type, is_group)

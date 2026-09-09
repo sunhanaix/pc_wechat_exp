@@ -1,6 +1,49 @@
 """Tests for chat_export.py — message formatting and HTML escaping."""
+import sqlite3
 import pytest
-from chat_export import _format_content, _escape_html
+from chat_export import _format_content, _escape_html, _resolve_sender_any
+
+
+@pytest.fixture
+def contact_db(tmp_path):
+    """Create a minimal contact.db with remark/nick/alias rows."""
+    p = tmp_path / 'contact.db'
+    con = sqlite3.connect(p)
+    con.execute('CREATE TABLE contact (id INTEGER, username TEXT, remark TEXT,'
+                ' nick_name TEXT, alias TEXT)')
+    con.executemany(
+        'INSERT INTO contact VALUES (?,?,?,?,?)',
+        [
+            (1, 'wxid_alpha_10e8', '张老师', '张', 'zhangs'),
+            (2, 'huoshuanghuan', '', '霍双欢', 'hsh2110'),
+            (3, 'wxid_noRemark_10e8', '', '无备注昵称', 'nobk'),
+        ])
+    con.commit()
+    con.close()
+    return str(p)
+
+
+class TestResolveSenderAny:
+    def test_exact_username_returns_remark(self, contact_db):
+        # wxid_alpha_10e8 row has remark 张老师
+        assert _resolve_sender_any('wxid_alpha', contact_db) == '张老师'
+
+    def test_username_without_remark_returns_nick(self, contact_db):
+        assert _resolve_sender_any('huoshuanghuan', contact_db) == '霍双欢'
+
+    def test_unsuffixed_base_resolves_to_suffixed_remark(self, contact_db):
+        # message DB stores wxid_noRemark (base), remark lives on suffixed row
+        assert _resolve_sender_any('wxid_noRemark', contact_db) == '无备注昵称'
+
+    def test_unknown_uid_returns_original(self, contact_db):
+        assert _resolve_sender_any('stranger_zzz', contact_db) == 'stranger_zzz'
+
+    def test_empty_uid_returns_original(self, contact_db):
+        assert _resolve_sender_any('', contact_db) == ''
+        assert _resolve_sender_any(None, contact_db) is None
+
+    def test_missing_contact_db_returns_original(self, tmp_path):
+        assert _resolve_sender_any('wxid_x', str(tmp_path / 'nope.db')) == 'wxid_x'
 
 
 class TestEscapeHtml:
