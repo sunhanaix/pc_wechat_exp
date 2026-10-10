@@ -82,9 +82,9 @@ def _resolve_sender_any(uid, contact_db_path):
 
 
 def export_chat(chat_info, out_dir, start_ts=None, end_ts=None, keyword=None,
-                print_fn=None, progress_fn=None, fmt='txt', display_name=None, include_asr=False, asr_lookup=None):
+                print_fn=None, progress_fn=None, fmt='txt', display_name=None, include_asr=False, asr_lookup=None, decrypted_dir=None):
     if include_asr and asr_lookup is None:
-        asr_lookup = make_asr_lookup(_chat_id_of(chat_info))
+        asr_lookup = make_asr_lookup(_chat_id_of(chat_info), decrypted_dir=decrypted_dir)
     """导出单个聊天的消息记录。
     Args:
         chat_info: from chat_list.scan_chats
@@ -469,7 +469,7 @@ def export_all_contacts(decrypted_dir, out_dir, start_ts=None, end_ts=None,
         progress_fn(pct, f"导出: {c['display_name']}")
 
         count, path = export_chat(c, out_dir, start_ts, end_ts, keyword,
-                                  print_fn=print_fn, fmt=fmt, include_asr=include_asr)
+                                  print_fn=print_fn, fmt=fmt, include_asr=include_asr, decrypted_dir=decrypted_dir)
         if count > 0:
             results.append((c["display_name"], count, path))
             print_fn(f"  {c['display_name']}: {count} 条消息 -> {os.path.basename(path)}")
@@ -477,7 +477,33 @@ def export_all_contacts(decrypted_dir, out_dir, start_ts=None, end_ts=None,
     return results
 
 
-def make_asr_lookup(chat_id, store=None):
+# 定位语音文件的缝隙：默认用 media.locate_voice_file；测试可替换它。
+_locate_voice_file = None
+
+
+def _voice_text_by_hash(decrypted_dir, chat_id, create_time, local_id, db_dir, store):
+    """按**语音内容哈希**查文字（issue #24 反馈第 1 点）。定位不到就返回 None。"""
+    global _locate_voice_file
+    try:
+        if _locate_voice_file is None:
+            from engine.services.media import locate_voice_file as _loc
+            _locate_voice_file = _loc
+        path = _locate_voice_file(decrypted_dir, '', create_time, local_id,
+                                  db_dir=db_dir, chat=chat_id)
+    except Exception:
+        return None
+    if not path:
+        return None
+    try:
+        from engine.services import asr_store as _s
+        h = _s._hash_of_path(path)
+        row = store.get(h) if store is not None else _s.AsrStore().get(h)
+    except Exception:
+        return None
+    return (row or {}).get('text') or None
+
+
+def make_asr_lookup(chat_id, store=None, decrypted_dir=None, db_dir=None):
     """返回 (create_time, local_id) -> 语音转写文字 的查询函数（issue #24 第④步）。
 
     只**读**转写存储、**不触发识别**：导出不该隐式跑模型。
@@ -491,7 +517,14 @@ def make_asr_lookup(chat_id, store=None):
         except Exception:
             return None
         row = rows.get(key)
-        return (row or {}).get('text') or None
+        text = (row or {}).get('text')
+        if text:
+            return text
+        if decrypted_dir:
+            # 三元组没命中：回退到"定位语音 → 内容哈希 → 查库"
+            return _voice_text_by_hash(decrypted_dir, chat_id, create_time, local_id,
+                                       db_dir, store)
+        return None
     return _lookup
 
 

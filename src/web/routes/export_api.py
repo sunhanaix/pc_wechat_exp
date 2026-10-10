@@ -263,7 +263,7 @@ def export_chat():
             count, filepath = export_chat(target, out_dir,
                                           start_ts=start_ts, end_ts=end_ts,
                                           print_fn=_print, fmt=fmt,
-                                          display_name=display_name_hint, include_asr=bool(data.get('include_asr')))
+                                          display_name=display_name_hint, include_asr=bool(data.get('include_asr')), decrypted_dir=decrypted_dir)
             if count and filepath:
                 fname = os.path.basename(filepath)
                 download_url = f'/api/export/download/{fname}'
