@@ -250,6 +250,48 @@ class VoicePlayerComponent {
     }
   }
 
+  // issue #24 反馈第 3 点：一键把本会话里**还没转写**的语音顺序转一遍。
+  // 复用既有 transcribeVoice（本地模型在浏览器里跑）；再点一次按钮 = 停止。
+  async transcribeAll() {
+    const btn = document.getElementById('btn-transcribe-all');
+    if (this._batchRunning) {                 // 再点一次 → 请求停止
+      this._batchCancel = true;
+      if (btn) btn.textContent = '停止中…';
+      return;
+    }
+    this._batchRunning = true;
+    this._batchCancel = false;
+    const targets = [];
+    document.querySelectorAll('.vp-trans-btn').forEach(function (b) {
+      const msgId = b.id.replace('vp-trans-btn-', '');
+      const resultEl = document.getElementById('vp-result-' + msgId);
+      const holder = b.closest('.msg-bubble') || b.parentElement || document;
+      const play = holder.querySelector('[onclick*="VoicePlayer.toggle(' + msgId + ',"]');
+      const m = play && /VoicePlayer\.toggle\(\d+,'([^']+)'/.exec(play.getAttribute('onclick') || '');
+      if (!m) return;
+      if (resultEl && resultEl.textContent.trim()) return;   // 已有文字 ⇒ 跳过
+      targets.push({ msgId: msgId, url: m[1] });
+    });
+    let done = 0;
+    try {
+      for (let i = 0; i < targets.length; i++) {
+        if (this._batchCancel) break;
+        if (btn) btn.textContent = 'T ' + (i + 1) + '/' + targets.length;
+        try {
+          await this.transcribeVoice(targets[i].msgId, targets[i].url);
+          done++;
+        } catch (e) { /* 单条失败不中断整批 */ }
+      }
+    } finally {
+      this._batchRunning = false;
+      this._batchCancel = false;
+      if (btn) {
+        btn.textContent = 'T';
+        btn.title = '批量转写本会话语音（本次完成 ' + done + '/' + targets.length + '）';
+      }
+    }
+  }
+
   // 语音识别模型缺失时的引导（首次使用需下载约 42MB，之后完全离线可用）
   showModelPrompt(msgId, voiceUrl, st) {
     const resultEl = document.getElementById('vp-result-' + msgId);
