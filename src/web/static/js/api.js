@@ -20,10 +20,14 @@ async function fetchJSON(url, signal) {
 }
 
 const api = {
-  contacts(q) {
+  contacts(q, limit, offset) {
     const signal = cancelPending();
-    const params = q ? `?q=${encodeURIComponent(q)}` : '';
-    return fetchJSON(`/api/contacts${params}`, signal);
+    const qs = new URLSearchParams();
+    if (q) qs.set('q', q);
+    if (limit) qs.set('limit', limit);           // issue #27：分页（不传 ⇒ 后端返回全部）
+    if (offset) qs.set('offset', offset);
+    const s = qs.toString();
+    return fetchJSON(`/api/contacts${s ? '?' + s : ''}`, signal);
   },
   messages(params) {
     const signal = cancelPending();

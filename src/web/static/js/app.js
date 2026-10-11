@@ -217,22 +217,65 @@ function _findContactByName(name) {
   return Store.data.contacts.find(c => c.name.toLowerCase().includes(q)) || null;
 }
 
+// issue #27：会话很多时（实测 2915 个、471KB）不再一次性拉全量，
+// 首次只取一页，滚动到底再追加下一页；总数由后端 total 给出。
+const CONTACTS_PAGE_SIZE = 200;
+
+function _renderContacts(loading, q) {
+  contactList.render({
+    contacts: Store.data.contacts || [],
+    activeId: Store.data.activeChat ? Store.data.activeChat.id : null,
+    loading: !!loading,
+    searchQuery: q || ''
+  });
+}
+
+function _ensureContactsScrollHook() {
+  const el = document.getElementById('contact-list');
+  if (!el || el.__pagingHook) return;
+  el.__pagingHook = true;
+  el.addEventListener('scroll', () => {
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 150) loadMoreContacts();
+  });
+}
+
 async function loadContacts(q) {
   Store.data.contactsLoading = true;
+  Store.data.contactsQuery = q || '';
+  Store.data.contactsOffset = 0;
+  Store.data.contactsTotal = 0;
   contactList.render({ contacts: [], loading: true, searchQuery: q || '' });
   try {
-    const data = await api.contacts(q || '');
-    Store.data.contacts = data.contacts;
+    const data = await api.contacts(q || '', CONTACTS_PAGE_SIZE, 0);
+    Store.data.contacts = data.contacts || [];
+    Store.data.contactsTotal = data.total || Store.data.contacts.length;
+    Store.data.contactsOffset = Store.data.contacts.length;
   } catch (e) { if (e.name !== 'AbortError') console.error(e); }
   finally {
     Store.data.contactsLoading = false;
-    contactList.render({
-      contacts: Store.data.contacts,
-      activeId: Store.data.activeChat ? Store.data.activeChat.id : null,
-      loading: false,
-      searchQuery: q || ''
-    });
+    _renderContacts(false, q);
+    _ensureContactsScrollHook();
   }
+}
+
+async function loadMoreContacts() {
+  if (Store.data.contactsLoading) return;
+  const q = Store.data.contactsQuery || '';
+  const loaded = (Store.data.contacts || []).length;
+  const total = Store.data.contactsTotal || 0;
+  if (!total || loaded >= total) return;          // 已取完
+  Store.data.contactsLoading = true;
+  try {
+    const data = await api.contacts(q, CONTACTS_PAGE_SIZE, loaded);
+    const more = data.contacts || [];
+    if (more.length) {
+      Store.data.contacts = (Store.data.contacts || []).concat(more);
+      Store.data.contactsOffset = Store.data.contacts.length;
+      Store.data.contactsTotal = data.total || total;
+      _renderContacts(false, q);
+    }
+  } catch (e) { if (e.name !== 'AbortError') console.error(e); }
+  finally { Store.data.contactsLoading = false; }
 }
 
 async function selectContact(chatId) {

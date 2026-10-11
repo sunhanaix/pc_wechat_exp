@@ -48,7 +48,19 @@ def contacts():
     if q:
         all_contacts = [c for c in all_contacts
                         if q in c['name'].lower() or q in c['id'].lower()]
-    return jsonify({'contacts': all_contacts, 'total': len(all_contacts)})
+    total = len(all_contacts)
+    # issue #27：支持分页（limit/offset）。**不传 limit 时返回全部**，保持旧行为，
+    # 老前端（聊天页侧边栏）不受影响；新前端可先取一页、滚动到底再取下一页，
+    # 避免一次把几千个会话（实测 471KB）全塞进首屏。
+    limit = request.args.get('limit', type=int)
+    offset = request.args.get('offset', type=int) or 0
+    if offset < 0:
+        offset = 0
+    page = all_contacts
+    if limit is not None and limit > 0:
+        page = all_contacts[offset:offset + limit]
+    return jsonify({'contacts': page, 'total': total, 'offset': offset,
+                    'limit': limit, 'returned': len(page)})
 
 
 @api_bp.route('/messages')

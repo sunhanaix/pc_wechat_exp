@@ -9,6 +9,7 @@ Uses the same resolution strategy as chat_list.scan_chats():
 """
 import hashlib
 import os
+import threading
 import re
 import sqlite3
 
@@ -34,6 +35,73 @@ def _own_wxid_forms(wxid):
     return {form for form in (wxid, bare_wxid(wxid)) if form}
 
 
+def _build_index_fn():
+    """索引构建函数（单独一层便于测试替换）。"""
+    from backup.indexer import build_index
+    return build_index
+
+
+def _ensure_chat_index(decrypted_dir: str) -> bool:
+    """确保 data/chats.db 索引存在，缺失则**补建一次**（issue #27）。
+
+    没有这个索引时 `get_contacts()` 会退化成"扫描所有消息分片"的慢路径：真机实测
+    2,539 个会话需要 **218 秒**，页面表现为长时间卡在"正在加载联系人"。
+    建好之后每次请求都走快路径。构建失败返回 False，调用方照旧走慢路径（不影响可用性）。
+    """
+    db = os.path.join(decrypted_dir, 'data', 'chats.db')
+    if os.path.isfile(db) and os.path.getsize(db) > 0:
+        return True
+    # 已有构建在飞（例如启动时的后台预建）⇒ 等它，别重复构建同一个 DB
+    inflight = None
+    with _index_build_lock:
+        inflight = _index_build_threads.get(os.path.abspath(decrypted_dir))
+    if (inflight is not None and inflight.is_alive() and inflight is not threading.current_thread()):
+        inflight.join(timeout=600)
+        return os.path.isfile(db) and os.path.getsize(db) > 0
+    try:
+        os.makedirs(os.path.dirname(db), exist_ok=True)
+        _build_index_fn()(decrypted_dir, db)
+        return os.path.isfile(db) and os.path.getsize(db) > 0
+    except Exception:
+        return False
+
+
+_index_build_lock = threading.Lock()
+_index_build_inflight = set()
+_index_build_threads = {}
+
+
+def ensure_chat_index_async(decrypted_dir: str):
+    """后台（守护线程）预建 chats.db 索引，立即返回（issue #27）。
+
+    首次打开聊天页若没有索引，`get_contacts()` 要现场建索引（真机实测约 28 秒）；
+    在服务启动时先把这一步做掉，用户第一次打开页面就是快的。
+    同一目录并发调用只会真正构建一次。
+    """
+    key = os.path.abspath(decrypted_dir)
+    db = os.path.join(decrypted_dir, 'data', 'chats.db')
+    if os.path.isfile(db) and os.path.getsize(db) > 0:
+        return None
+    with _index_build_lock:
+        if key in _index_build_inflight:
+            return None
+        _index_build_inflight.add(key)
+
+    def _run():
+        try:
+            _ensure_chat_index(decrypted_dir)
+        finally:
+            with _index_build_lock:
+                _index_build_inflight.discard(key)
+                _index_build_threads.pop(key, None)
+
+    th = threading.Thread(target=_run, name='chats-index-prebuild', daemon=True)
+    with _index_build_lock:
+        _index_build_threads[key] = th
+    th.start()
+    return th
+
+
 def get_contacts(decrypted_dir: str, wxid: str = None) -> list:
     """Return all contacts from decrypted WeChat 4.x message databases.
 
@@ -42,6 +110,10 @@ def get_contacts(decrypted_dir: str, wxid: str = None) -> list:
     """
     # Fast path: pre-built summary index
     contacts = _load_from_chats_db(decrypted_dir, wxid)
+    if not contacts:
+        # issue #27：索引缺失 ⇒ 按需补建一次（否则退化成全库扫描，200 秒级）
+        if _ensure_chat_index(decrypted_dir):
+            contacts = _load_from_chats_db(decrypted_dir, wxid)
     if contacts:
         _enrich_contacts_chatroom_names(decrypted_dir, contacts)
         return contacts

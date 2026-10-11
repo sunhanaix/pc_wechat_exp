@@ -180,6 +180,13 @@ def cmd_serve(args):
     db_dir = args.db_dir
     wxid = get_backup_wxid()
 
+    # issue #27：启动时**后台**预建会话索引 —— 首次打开聊天页就不用现场建（真机实测约 28 秒）
+    try:
+        from engine.services.chat import ensure_chat_index_async
+        ensure_chat_index_async(decrypted)
+        print('[index] 已在后台预建会话索引（缺失时）')
+    except Exception as _e:
+        print('[index] 预建索引跳过:', _e)
     print(f"启动 Web 查看器 v{__version__}...")
     print(f"  解密目录: {decrypted}")
     print(f"  地址: http://{args.host}:{args.port}")
