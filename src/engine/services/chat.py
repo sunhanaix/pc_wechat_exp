@@ -8,6 +8,7 @@ Uses the same resolution strategy as chat_list.scan_chats():
 5. Resolve each chat via _resolve_display()
 """
 import hashlib
+import json
 import os
 import threading
 import re
@@ -102,6 +103,74 @@ def ensure_chat_index_async(decrypted_dir: str):
     return th
 
 
+def _slow_cache_fingerprint(decrypted_dir: str) -> str:
+    """慢路径缓存的指纹：各 message_N.db + contact.db + session.db 的 (名字,大小,mtime)。
+
+    任一源文件变化（重新解密/新备份）⇒ 指纹不同 ⇒ 缓存自动失效。
+    """
+    cands = []
+    for base in (os.path.join(decrypted_dir, 'message'), decrypted_dir):
+        try:
+            for name in sorted(os.listdir(base)):
+                if re.match(r'message_\d+\.db$', name, re.IGNORECASE):
+                    cands.append(os.path.join(base, name))
+        except OSError:
+            pass
+    for rel in ('contact/contact.db', 'session/session.db'):
+        p = os.path.join(decrypted_dir, *rel.split('/'))
+        if os.path.isfile(p):
+            cands.append(p)
+    parts = []
+    for p in sorted(set(cands)):
+        try:
+            st = os.stat(p)
+            parts.append('%s:%d:%d' % (os.path.basename(p), st.st_size, int(st.st_mtime)))
+        except OSError:
+            pass
+    return '|'.join(parts)
+
+
+def _slow_cache_path(decrypted_dir: str) -> str:
+    return os.path.join(decrypted_dir, 'data', 'contacts_cache.json')
+
+
+def _load_slow_cache(decrypted_dir: str, wxid):
+    """命中返回联系人列表；未命中/损坏/指纹不符返回 None（issue #27-B(d)）。"""
+    fp = _slow_cache_fingerprint(decrypted_dir)
+    if not fp:
+        return None
+    try:
+        with open(_slow_cache_path(decrypted_dir), encoding='utf-8') as f:
+            data = json.load(f)
+        if data.get('fingerprint') != fp:
+            return None
+        if (data.get('wxid') or None) != (wxid or None):
+            return None
+        contacts = data.get('contacts')
+        if isinstance(contacts, list) and contacts:
+            return contacts
+    except Exception:
+        return None
+    return None
+
+
+def _save_slow_cache(decrypted_dir: str, wxid, contacts) -> None:
+    """原子写入慢路径结果（失败静默：缓存只是加速，绝不能影响正确性）。"""
+    try:
+        fp = _slow_cache_fingerprint(decrypted_dir)
+        if not fp or not contacts:
+            return
+        path = _slow_cache_path(decrypted_dir)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as f:
+            json.dump({'fingerprint': fp, 'wxid': wxid, 'contacts': contacts},
+                      f, ensure_ascii=False)
+        os.replace(tmp, path)
+    except Exception:
+        pass
+
+
 def get_contacts(decrypted_dir: str, wxid: str = None) -> list:
     """Return all contacts from decrypted WeChat 4.x message databases.
 
@@ -116,6 +185,11 @@ def get_contacts(decrypted_dir: str, wxid: str = None) -> list:
     if contacts:
         _enrich_contacts_chatroom_names(decrypted_dir, contacts)
         return contacts
+
+    # issue #27-B(d)：慢路径结果缓存（指纹不变就不再全库扫描）
+    cached = _load_slow_cache(decrypted_dir, wxid)
+    if cached is not None:
+        return cached
 
     # Slow path: full scan of all message databases
     msg_dir = os.path.join(decrypted_dir, "message")
@@ -204,7 +278,9 @@ def get_contacts(decrypted_dir: str, wxid: str = None) -> list:
         except sqlite3.Error:
             continue
 
-    return sorted(contacts.values(), key=lambda c: c['last_msg_time'] or 0, reverse=True)
+    result = sorted(contacts.values(), key=lambda c: c['last_msg_time'] or 0, reverse=True)
+    _save_slow_cache(decrypted_dir, wxid, result)
+    return result
 
 
 def _enrich_contacts_chatroom_names(decrypted_dir: str, contacts: list) -> None:
