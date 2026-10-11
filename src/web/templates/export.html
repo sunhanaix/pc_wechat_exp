@@ -63,7 +63,8 @@
 {% endblock %}
 {% block scripts %}
 <script src="{{ url_for('static', filename='js/sse_progress.js') }}"></script>
-<label style="display:block;margin:10px 0 0 0" title="只带上已经转写过的语音（只读转写库，不会为了导出而跑识别）"><input type="checkbox" id="cfg-asr"> 包含语音转文字（如有）</label>
+<label title="勾选后会给还没转写的语音现场做一次识别（较慢；需要已下载本地模型或配置百度 Key）"><input type="checkbox" id="cfg-transcribe"> 顺带识别还没转写的语音（较慢）</label>
+<label title="只带上已经转写过的语音（只读转写库，不会为了导出而跑识别）"><input type="checkbox" id="cfg-asr"> 包含语音转文字（如有）</label>
 <script src="{{ url_for('static', filename='js/wizard.js') }}"></script>
 <script>
 new WizardPage({
@@ -77,6 +78,7 @@ new WizardPage({
     date_end: document.getElementById('cfg-end').value,
     format: document.getElementById('cfg-format').value,
     include_asr: !!(document.getElementById('cfg-asr') && document.getElementById('cfg-asr').checked),
+    transcribe_missing: !!(document.getElementById('cfg-transcribe') && document.getElementById('cfg-transcribe').checked),
   }),
 });
 </script>

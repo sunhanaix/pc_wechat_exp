@@ -156,6 +156,18 @@ def export_chat():
     date_start = data.get('date_start', '')
     date_end = data.get('date_end', '')
     fmt = data.get('format', 'txt')
+    # 勾了「顺带识别」但没有可用引擎时给出可操作提示（issue #24 反馈④）
+    if data.get('transcribe_missing'):
+        try:
+            from chat_export import asr_engine_available
+            _ok, _eng = asr_engine_available()
+        except Exception:
+            _ok, _eng = True, ''
+        if not _ok:
+            return jsonify({
+                'error': 'no_asr_engine',
+                'message': '未检测到可用的识别引擎：请在「设置」里下载本地模型，或填写百度语音识别 Key，再勾选此选项',
+            }), 400
 
     decrypted_dir = _decrypted_dir()
     # 注意：后台线程没有 Flask 应用上下文，配置必须在此处（请求线程内）取出
@@ -263,7 +275,8 @@ def export_chat():
             count, filepath = export_chat(target, out_dir,
                                           start_ts=start_ts, end_ts=end_ts,
                                           print_fn=_print, fmt=fmt,
-                                          display_name=display_name_hint, include_asr=bool(data.get('include_asr')), decrypted_dir=decrypted_dir)
+                                          display_name=display_name_hint, include_asr=bool(data.get('include_asr')) or bool(data.get('transcribe_missing')),
+                                  transcribe_missing=bool(data.get('transcribe_missing')), decrypted_dir=decrypted_dir)
             if count and filepath:
                 fname = os.path.basename(filepath)
                 download_url = f'/api/export/download/{fname}'

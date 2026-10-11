@@ -143,16 +143,31 @@ class AsrStore:
         return out
 
     def find_by_messages(self, chat_id: str, pairs):
-        """按 (create_time, local_id) 反查。返回 {(create_time, local_id): row}。"""
+        """按 (create_time, local_id) 批量反查。返回 {(create_time, local_id): row}。
+
+        issue #24 反馈：原来**一条消息一次 SQL**，几百条语音时页面会卡住；
+        现在改为分块 `IN` 批量查询（每块 200 个），一次请求只碰几次数据库。
+        """
+        items = []
+        for ct, lid in (pairs or []):
+            try:
+                items.append((int(ct), int(lid)))
+            except (TypeError, ValueError):
+                continue
         out = {}
+        if not items or not chat_id:
+            return out
         with self._lock:
-            for create_time, local_id in pairs or []:
+            for i in range(0, len(items), 200):
+                chunk = items[i:i + 200]
+                cond = " OR ".join("(create_time=? AND local_id=?)" for _ in chunk)
+                params = [chat_id]
+                for ct, lid in chunk:
+                    params.extend([ct, lid])
                 cur = self._conn.execute(
-                    "SELECT * FROM transcripts WHERE chat_id=? AND create_time=?"
-                    " AND local_id=?", (chat_id, int(create_time), int(local_id)))
-                row = cur.fetchone()
-                if row:
-                    out[(int(create_time), int(local_id))] = dict(row)
+                    "SELECT * FROM transcripts WHERE chat_id=? AND (" + cond + ")", params)
+                for row in cur.fetchall():
+                    out[(int(row['create_time']), int(row['local_id']))] = dict(row)
         return out
 
     def stats(self) -> dict:

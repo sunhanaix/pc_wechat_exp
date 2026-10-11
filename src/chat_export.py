@@ -82,9 +82,10 @@ def _resolve_sender_any(uid, contact_db_path):
 
 
 def export_chat(chat_info, out_dir, start_ts=None, end_ts=None, keyword=None,
-                print_fn=None, progress_fn=None, fmt='txt', display_name=None, include_asr=False, asr_lookup=None, decrypted_dir=None):
+                print_fn=None, progress_fn=None, fmt='txt', display_name=None, include_asr=False, asr_lookup=None, decrypted_dir=None, transcribe_missing=False):
     if include_asr and asr_lookup is None:
-        asr_lookup = make_asr_lookup(_chat_id_of(chat_info), decrypted_dir=decrypted_dir)
+        asr_lookup = make_asr_lookup(_chat_id_of(chat_info), decrypted_dir=decrypted_dir,
+                                     transcribe_missing=transcribe_missing)
     """导出单个聊天的消息记录。
     Args:
         chat_info: from chat_list.scan_chats
@@ -440,7 +441,7 @@ def _format_content(content, base_type, is_group, voice_text=None):
 
 def export_all_contacts(decrypted_dir, out_dir, start_ts=None, end_ts=None,
                         keyword=None, name_filter=None, print_fn=None,
-                        progress_fn=None, fmt='txt', include_asr=False):
+                        progress_fn=None, fmt='txt', include_asr=False, transcribe_missing=False):
     """导出所有匹配联系人的聊天记录。
     Args:
         name_filter: 只导出显示名/用户名包含该关键词的会话
@@ -469,12 +470,44 @@ def export_all_contacts(decrypted_dir, out_dir, start_ts=None, end_ts=None,
         progress_fn(pct, f"导出: {c['display_name']}")
 
         count, path = export_chat(c, out_dir, start_ts, end_ts, keyword,
-                                  print_fn=print_fn, fmt=fmt, include_asr=include_asr, decrypted_dir=decrypted_dir)
+                                  print_fn=print_fn, fmt=fmt, include_asr=include_asr, decrypted_dir=decrypted_dir, transcribe_missing=transcribe_missing)
         if count > 0:
             results.append((c["display_name"], count, path))
             print_fn(f"  {c['display_name']}: {count} 条消息 -> {os.path.basename(path)}")
 
     return results
+
+
+def asr_engine_available():
+    """是否具备"顺手转写"的引擎：本地 faster-whisper 可导入，或配置了百度 Key。
+
+    导出时顺带识别是**可选**功能，引擎不可用时界面应置灰而不是让用户白等。
+    """
+    try:
+        import faster_whisper  # noqa: F401
+        return True, 'local'
+    except Exception:
+        pass
+    try:
+        from engine.config_file import _config_path
+        import json
+        cfg = json.load(open(_config_path(), encoding='utf-8'))
+        if (cfg.get('baidu_api_key') or '').strip() and (cfg.get('baidu_secret_key') or '').strip():
+            return True, 'baidu'
+    except Exception:
+        pass
+    return False, ''
+
+
+def _transcribe_missing(decrypted_dir, chat_id, create_time, local_id, db_dir=None):
+    """给一条还没转写的语音做识别并入库（复用 transcribe_voice_cached：成功会自动落库）。"""
+    try:
+        from engine.services.media import transcribe_voice_cached
+        res = transcribe_voice_cached(decrypted_dir, '', create_time=create_time,
+                                      local_id=local_id, chat=chat_id, db_dir=db_dir)
+        return (res or {}).get('text') or None
+    except Exception:
+        return None
 
 
 # 定位语音文件的缝隙：默认用 media.locate_voice_file；测试可替换它。
@@ -503,7 +536,8 @@ def _voice_text_by_hash(decrypted_dir, chat_id, create_time, local_id, db_dir, s
     return (row or {}).get('text') or None
 
 
-def make_asr_lookup(chat_id, store=None, decrypted_dir=None, db_dir=None):
+def make_asr_lookup(chat_id, store=None, decrypted_dir=None, db_dir=None,
+                    transcribe_missing=False):
     """返回 (create_time, local_id) -> 语音转写文字 的查询函数（issue #24 第④步）。
 
     只**读**转写存储、**不触发识别**：导出不该隐式跑模型。
@@ -522,8 +556,14 @@ def make_asr_lookup(chat_id, store=None, decrypted_dir=None, db_dir=None):
             return text
         if decrypted_dir:
             # 三元组没命中：回退到"定位语音 → 内容哈希 → 查库"
-            return _voice_text_by_hash(decrypted_dir, chat_id, create_time, local_id,
+            text = _voice_text_by_hash(decrypted_dir, chat_id, create_time, local_id,
                                        db_dir, store)
+            if text:
+                return text
+            if transcribe_missing:
+                # 仍没有：用户明确要求"顺带识别" ⇒ 现场识别一次（成功会自动入库）
+                return _transcribe_missing(decrypted_dir, chat_id, create_time, local_id,
+                                           db_dir)
         return None
     return _lookup
 

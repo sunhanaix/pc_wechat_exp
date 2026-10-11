@@ -16,13 +16,18 @@ class ChatHeader extends Component {
     const giBtn = data.type === 'group'
       ? '<button class="gi-btn" title="群信息">&#x2139;</button>'
       : '';
+    // issue #24：批量转写本会话语音。注意必须在这里生成 —— 头部是 JS 重建的，
+    // 写在 index.html 静态模板里的按钮会被本次渲染覆盖掉（用户会"找不到"）。
+    const transBtn = '<button id="btn-transcribe-all" class="hdr-act" '
+      + 'title="批量转写本会话语音（已有文字的会跳过；再点一次可停止）">批量转写</button>';
     return `
       ${avatarImg}
       <div class="header-info">
         <span class="chat-name">${escapeHtml(data.name)}</span>
         <span class="chat-stats">${escapeHtml(statsText)}</span>
       </div>
-      ${giBtn}`;
+      ${giBtn}
+      ${transBtn}`;
   }
 
   mount() {
@@ -30,6 +35,10 @@ class ChatHeader extends Component {
     this.el.addEventListener('click', (e) => {
       if (e.target.closest('.gi-btn')) {
         Store.emit('group-info-toggle');
+        return;
+      }
+      if (e.target.closest('#btn-transcribe-all')) {
+        if (window.VoicePlayer && VoicePlayer.transcribeAll) VoicePlayer.transcribeAll();
       }
     });
   }

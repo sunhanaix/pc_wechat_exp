@@ -198,6 +198,76 @@ class VoicePlayerComponent {
     }
   }
 
+  // issue #24 反馈③：改为"滚动到才加载"——只给进入视口的语音查已存文字，
+  // 每条只查一次（data-asr-asked 标记），按会话分组、每批最多 200 条。
+  // 浏览器不支持 IntersectionObserver 时回退到整体加载（loadSavedTranscripts）。
+  transcriptsOnScroll() {
+    if (typeof IntersectionObserver === 'undefined') { this.loadSavedTranscripts(); return; }
+    const self = this;
+    if (!this._asrObserver) {
+      this._asrObserver = new IntersectionObserver(function (entries) {
+        const batch = [];
+        entries.forEach(function (e) {
+          if (!e.isIntersecting) return;
+          const el = e.target;
+          self._asrObserver.unobserve(el);
+          if (el.dataset.asrAsked) return;
+          el.dataset.asrAsked = '1';
+          const msgId = el.id.replace('vp-result-', '');
+          const holder = el.closest('.msg-bubble') || el.parentElement || document;
+          const play = holder.querySelector('[onclick*="VoicePlayer.toggle(' + msgId + ',"]');
+          const m = play && /VoicePlayer\.toggle\(\d+,'([^']+)'/.exec(play.getAttribute('onclick') || '');
+          if (!m) return;
+          const q = new URLSearchParams((m[1].split('?')[1] || ''));
+          const chat = q.get('chat'), ct = q.get('create_time'), lid = q.get('local_id');
+          if (!chat || !ct || !lid) return;
+          batch.push({ msgId: msgId, chat: chat, key: ct + ':' + lid });
+        });
+        self._fetchTranscripts(batch);
+      }, { rootMargin: '300px 0px' });
+    }
+    document.querySelectorAll('[id^="vp-result-"]:not([data-asr-asked])').forEach(function (el) {
+      self._asrObserver.observe(el);
+    });
+  }
+
+  // 按会话分组批量取回并填充（一个会话一次请求；每批上限 200 条）
+  _fetchTranscripts(batch) {
+    if (!batch || !batch.length) return;
+    const groups = {};
+    const where = {};
+    batch.slice(0, 200).forEach(function (it) {
+      (groups[it.chat] = groups[it.chat] || []).push(it.key);
+      (where[it.chat + '|' + it.key] = where[it.chat + '|' + it.key] || []).push(it.msgId);
+    });
+    Object.keys(groups).forEach(function (chat) {
+      fetch('/api/voice/transcripts?chat=' + encodeURIComponent(chat) +
+            '&items=' + encodeURIComponent(groups[chat].join(',')))
+        .then(function (r) { return r.json(); })
+        .then(function (d) {
+          const rows = (d && d.transcripts) || {};
+          Object.keys(rows).forEach(function (key) {
+            const text = rows[key] && rows[key].text;
+            if (!text) return;
+            (where[chat + '|' + key] || []).forEach(function (msgId) {
+              const resultEl = document.getElementById('vp-result-' + msgId);
+              const btn = document.getElementById('vp-trans-btn-' + msgId);
+              if (resultEl && !resultEl.textContent) {
+                resultEl.textContent = text;
+                resultEl.className = 'vp-trans-result success';
+                resultEl.style.display = '';
+              }
+              if (btn && !btn.disabled) {
+                btn.textContent = '重新识别';
+                btn.title = '重新识别（会覆盖已保存的文字）';
+              }
+            });
+          });
+        })
+        .catch(function (e) { console.warn('读取已存转写失败（不影响其它功能）', e); });
+    });
+  }
+
   // issue #24：载入会话时把**已经转写并保存过**的文字自动带出来（只读，不触发识别）。
   // 语音消息的播放按钮上带着 voiceUrl（含 chat/create_time/local_id），从 DOM 直接读，
   // 按会话分组各发一次请求，避免每条语音一个请求。
@@ -215,6 +285,7 @@ class VoicePlayerComponent {
         const q = new URLSearchParams((m[1].split('?')[1] || ''));
         const chat = q.get('chat'), ct = q.get('create_time'), lid = q.get('local_id');
         if (!chat || !ct || !lid) return;
+        if (Object.keys(targets).length > 400) return;   // issue #24 反馈③：设上限，避免大会话卡页面
         const key = ct + ':' + lid;
         (groups[chat] = groups[chat] || []).push(key);
         (targets[chat + '|' + key] = targets[chat + '|' + key] || []).push(msgId);
@@ -399,8 +470,10 @@ const transcribeVoice = (msgId, voicePath) => VoicePlayer.transcribeVoice(msgId,
 // 模型下载完成刷新页面后，自动重试之前被中断的转写
 if (document.readyState === 'loading') {
   document.addEventListener('DOMContentLoaded', () => VoicePlayer.tryAutoRetry());
-  document.addEventListener('DOMContentLoaded', () => VoicePlayer.loadSavedTranscripts());
+  document.addEventListener('DOMContentLoaded', () => VoicePlayer.transcriptsOnScroll());
 } else {
   setTimeout(() => VoicePlayer.tryAutoRetry(), 1500);
-  setTimeout(() => VoicePlayer.loadSavedTranscripts(), 1800);
+  setTimeout(() => VoicePlayer.transcriptsOnScroll(), 1800);
+  // 会话切换/翻页后新渲染的语音同样按需加载
+  setInterval(() => VoicePlayer.transcriptsOnScroll(), 3000);
 }
