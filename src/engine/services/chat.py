@@ -9,7 +9,6 @@ Uses the same resolution strategy as chat_list.scan_chats():
 """
 import hashlib
 import json
-from concurrent.futures import ThreadPoolExecutor
 import os
 import threading
 import re
@@ -172,49 +171,6 @@ def _save_slow_cache(decrypted_dir: str, wxid, contacts) -> None:
         pass
 
 
-# issue #27-B(e)：分片并行度（测试可改小以对比串行结果）
-_SHARD_WORKERS = 8
-
-
-def _scan_one_shard(db_path, hash_to_name, own_forms, resolve):
-    """扫描**单个**消息分片，返回 {uname: entry}（分片内已按 last_msg_time 去重）。
-
-    只读共享数据 + 自己开连接 ⇒ 可安全并发。
-    """
-    out = {}
-    try:
-        conn = sqlite3.connect(db_path)
-        tables = conn.execute(
-            "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
-        ).fetchall()
-        for (tname,) in tables:
-            h = tname[4:]
-            uname = hash_to_name.get(h) or ("unknown_" + h[:8])
-            if uname in own_forms:
-                continue
-            row = conn.execute(
-                "SELECT COUNT(*), MAX(create_time) FROM [" + tname + "]"
-            ).fetchone()
-            cnt = row[0] if row else 0
-            last_time = row[1] if row else 0
-            prev = out.get(uname)
-            if prev is not None and (last_time or 0) <= (prev.get('last_msg_time') or 0):
-                continue
-            is_group = uname.endswith('@chatroom')
-            out[uname] = {
-                'id': uname,
-                'name': resolve(uname, is_group),
-                'type': 'group' if is_group else 'user',
-                'last_msg_time': last_time,
-                'msg_count': cnt,
-                'avatar_url': '/api/avatar/' + uname,
-            }
-        conn.close()
-    except sqlite3.Error:
-        return out
-    return out
-
-
 def get_contacts(decrypted_dir: str, wxid: str = None) -> list:
     """Return all contacts from decrypted WeChat 4.x message databases.
 
@@ -273,34 +229,54 @@ def get_contacts(decrypted_dir: str, wxid: str = None) -> list:
     # Pre-load chatroom names from chat_room.ext_buffer for the slow path
     chatroom_names = _load_chatroom_names(decrypted_dir)
 
-    own_forms = _own_wxid_forms(wxid)
-
-    def _resolve(uname, is_group):
-        r = _resolve_display(uname, is_group, decrypted_dir,
-                             id_to_name, name_to_id,
-                             session_summaries, room_owners,
-                             group_members)
-        if r == uname and is_group:                  # Fallback: chat_room.ext_buffer
-            r = chatroom_names.get(uname, r)
-        return r
-
-    # issue #27-B(e)：分片并行扫描（实测逐会话 COUNT/MAX 全表扫描占慢路径 98%+），
-    # 主线程按"同一会话取 last_msg_time 更大者"合并 —— 与串行结果完全一致。
-    paths = [p for _idx, p in msg_dbs]
-    workers = max(1, min(int(_SHARD_WORKERS), len(paths) or 1))
     contacts = {}
-    if workers > 1 and len(paths) > 1:
-        with ThreadPoolExecutor(max_workers=workers) as ex:
-            parts = list(ex.map(lambda p: _scan_one_shard(p, hash_to_name, own_forms, _resolve),
-                                paths))
-    else:
-        parts = [_scan_one_shard(p, hash_to_name, own_forms, _resolve) for p in paths]
+    own_forms = _own_wxid_forms(wxid)
+    for idx, db_path in msg_dbs:
+        try:
+            conn = sqlite3.connect(db_path)
+            tables = conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name LIKE 'Msg_%'"
+            ).fetchall()
+            for (tname,) in tables:
+                h = tname[4:]
+                uname = hash_to_name.get(h)
+                if not uname:
+                    uname = f"unknown_{h[:8]}"
+                if uname in own_forms:
+                    continue
 
-    for part in parts:
-        for uname, entry in part.items():
-            prev = contacts.get(uname)
-            if prev is None or (entry.get('last_msg_time') or 0) > (prev.get('last_msg_time') or 0):
-                contacts[uname] = entry
+                # issue #27-B：COUNT 与 MAX 合并成一条查询（每个会话少一次往返；
+                # 结果与分两条查完全一致）
+                count_row, last_row = conn.execute(
+                    f"SELECT COUNT(*), MAX(create_time) FROM [{tname}]"
+                ).fetchone()[:2]
+                count_row = (count_row,)
+                last_row = (last_row,)
+                cnt = count_row[0] if count_row else 0
+                last_time = last_row[0] if last_row else 0
+
+                if uname in contacts and (last_time or 0) <= (contacts[uname].get('last_msg_time') or 0):
+                    continue
+
+                is_group = uname.endswith('@chatroom')
+                resolved = _resolve_display(uname, is_group, decrypted_dir,
+                                              id_to_name, name_to_id,
+                                              session_summaries, room_owners,
+                                              group_members)
+                # Fallback to chat_room.ext_buffer if still unresolved
+                if resolved == uname and is_group:
+                    resolved = chatroom_names.get(uname, resolved)
+                contacts[uname] = {
+                    'id': uname,
+                    'name': resolved,
+                    'type': 'group' if is_group else 'user',
+                    'last_msg_time': last_time,
+                    'msg_count': cnt,
+                    'avatar_url': f'/api/avatar/{uname}',
+                }
+            conn.close()
+        except sqlite3.Error:
+            continue
 
     result = sorted(contacts.values(), key=lambda c: c['last_msg_time'] or 0, reverse=True)
     _save_slow_cache(decrypted_dir, wxid, result)
