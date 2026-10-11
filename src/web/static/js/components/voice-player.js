@@ -475,5 +475,8 @@ if (document.readyState === 'loading') {
   setTimeout(() => VoicePlayer.tryAutoRetry(), 1500);
   setTimeout(() => VoicePlayer.transcriptsOnScroll(), 1800);
   // 会话切换/翻页后新渲染的语音同样按需加载
-  setInterval(() => VoicePlayer.transcriptsOnScroll(), 3000);
+  // 某些执行环境（如测试用的 Node 脚本 realm）没有 setInterval，需先判断
+  if (typeof setInterval === 'function') {
+    setInterval(() => VoicePlayer.transcriptsOnScroll(), 3000);
+  }
 }

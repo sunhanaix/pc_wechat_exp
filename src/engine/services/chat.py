@@ -109,11 +109,10 @@ def get_contacts(decrypted_dir: str, wxid: str = None) -> list:
     backup index phase). Falls back to slow full-scan if chats.db is missing.
     """
     # Fast path: pre-built summary index
+    # 注意：这里**不要**自动补建索引 —— 快路径与慢路径的 chat_id 形式不同
+    # （慢路径做了裸 wxid 归一化），混用会改变结果集（issue #27 回归修复）。
+    # 索引的补建放在 serve 启动时的后台预建里（ensure_chat_index_async）。
     contacts = _load_from_chats_db(decrypted_dir, wxid)
-    if not contacts:
-        # issue #27：索引缺失 ⇒ 按需补建一次（否则退化成全库扫描，200 秒级）
-        if _ensure_chat_index(decrypted_dir):
-            contacts = _load_from_chats_db(decrypted_dir, wxid)
     if contacts:
         _enrich_contacts_chatroom_names(decrypted_dir, contacts)
         return contacts
