@@ -171,12 +171,13 @@ def get_contacts(decrypted_dir: str, wxid: str = None) -> list:
                 if uname in own_forms:
                     continue
 
-                count_row = conn.execute(
-                    f"SELECT COUNT(*) FROM [{tname}]"
-                ).fetchone()
-                last_row = conn.execute(
-                    f"SELECT MAX(create_time) FROM [{tname}]"
-                ).fetchone()
+                # issue #27-B：COUNT 与 MAX 合并成一条查询（每个会话少一次往返；
+                # 结果与分两条查完全一致）
+                count_row, last_row = conn.execute(
+                    f"SELECT COUNT(*), MAX(create_time) FROM [{tname}]"
+                ).fetchone()[:2]
+                count_row = (count_row,)
+                last_row = (last_row,)
                 cnt = count_row[0] if count_row else 0
                 last_time = last_row[0] if last_row else 0
 
