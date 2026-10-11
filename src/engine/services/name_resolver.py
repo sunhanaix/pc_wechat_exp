@@ -62,7 +62,50 @@ def extract_chatroom_name(ext_buffer: bytes) -> str | None:
     return None
 
 
+_chatroom_names_cache = {}          # decrypted_dir -> (指纹, 映射)
+
+
+def _dir_fingerprint(decrypted_dir: str) -> str:
+    """数据目录指纹：各子目录下 *.db 的 (目录/名称, 大小, mtime)。任一变化即失效。"""
+    parts = []
+    try:
+        bases = [decrypted_dir]
+        for name in os.listdir(decrypted_dir):
+            p = os.path.join(decrypted_dir, name)
+            if os.path.isdir(p):
+                bases.append(p)
+        for base in bases:
+            try:
+                for f in sorted(os.listdir(base)):
+                    if f.lower().endswith('.db'):
+                        st = os.stat(os.path.join(base, f))
+                        parts.append('%s/%s:%d:%d' % (os.path.basename(base), f,
+                                                      st.st_size, int(st.st_mtime)))
+            except OSError:
+                pass
+    except OSError:
+        return ''
+    return '|'.join(parts)
+
+
 def _load_chatroom_names(decrypted_dir: str) -> dict:
+    """群名映射（带缓存）。实测解析一次约 0.4s，而 /api/contacts 每次请求都要用它。
+
+    按数据目录指纹缓存；指纹变化（重新解密/新备份）自动失效。
+    注意：**返回的是缓存对象，调用方只能读、不得修改**。
+    """
+    key = os.path.abspath(decrypted_dir)
+    fp = _dir_fingerprint(decrypted_dir)
+    hit = _chatroom_names_cache.get(key)
+    if fp and hit and hit[0] == fp:
+        return hit[1]
+    data = _load_chatroom_names_uncached(decrypted_dir)
+    if fp:
+        _chatroom_names_cache[key] = (fp, data)
+    return data
+
+
+def _load_chatroom_names_uncached(decrypted_dir: str) -> dict:
     """Load {chatroom_id: display_name} from chat_room table in contact.db.
 
     Strategy:
