@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.coverage
+
+# Virtualenv
+.venv/
+venv/
+
+# PyInstaller
+build/
+dist/
+*.spec.bak
+
+# 运行态产物与**密钥**（绝不入库）
+output/
+backup/
+.wechat_exp_config.json
+*_state.json
+all_keys.json
+_media_keys.json
