@@ -74,6 +74,19 @@ def create_app(decrypted_dir: str, wxid: str = None, db_dir: str = None) -> Flas
     def _inject_version():
         return {'app_version': __version__}
 
+    # 冷启动自愈：`WXID` 上面**只解析一次**。若 `serve` 启动时备份/解密还没产出
+    # `output/decrypted/{hardlink,contact,message}`，`resolve_account_dir` 就检测不到账号目录
+    # ⇒ `WXID = None` ⇒ `_row_to_message` 里 `if name2id is not None and own_wxid:` 不成立，
+    # **权威 Name2Id 发送者模型整条被跳过**，退回旧启发式；单聊里对方的消息不带
+    # `wxid:\n` 前缀、`sender_map` 又是空的，于是 `elif ltype == 1 and content.strip()`
+    # 把**每一条纯文本都判成"我"**（图片/系统消息不受影响，所以表现为"有些话对不上"）。
+    # 该值在进程内被缓存，事后再跑备份也不会自愈 —— 只能重启服务。
+    # 这里按请求惰性补解析（仅当为空时触发，代价是几次 os.path.isdir，无副作用）。
+    @app.before_request
+    def _ensure_wxid():
+        if not app.config.get('WXID'):
+            app.config['WXID'] = resolve_account_dir(app.config.get('DECRYPTED_DIR'), None)
+
     # Existing API
     def _register_api_bp():
         from .routes.api import api_bp
