@@ -26,7 +26,7 @@ def avatar(username):
     ext, body = _fetch_avatar(decrypted_dir, username)
     # issue #27 深入②：加 ETag + 强缓存 —— 首屏几十张头像在浏览器里各要 1.1s+（服务端仅 0.05s，
     # 成本在排队），带上缓存后重复进入/切会话/翻页不再重新下载。
-    etag = '"' + _hashlib.md5(body if isinstance(body, bytes) else bytes(body)).hexdigest() + '"'
+    etag = '"' + _hashlib.md5(body.encode('utf-8') if isinstance(body, str) else bytes(body)).hexdigest() + '"'
     inm = (request.headers.get('If-None-Match') or '').strip()
     if inm and etag in [p.strip() for p in inm.split(',')]:
         resp = Response(status=304, mimetype='image/png')
@@ -115,7 +115,7 @@ def _fetch_avatar(decrypted_dir: str, username: str) -> tuple:
     if url:
         cache_dir = os.path.join(os.path.dirname(decrypted_dir), 'avatar_cache')
         os.makedirs(cache_dir, exist_ok=True)
-        cache_key = __hashlib.md5(username.encode()).hexdigest()
+        cache_key = _hashlib.md5(username.encode()).hexdigest()
         # Check both jpg and png cache variants
         for ext in ('jpg', 'png'):
             cache_path = os.path.join(cache_dir, cache_key + '.' + ext)
@@ -161,7 +161,7 @@ def _first_char(s: str) -> str:
 
 def _make_default_avatar_svg(username: str, ch: str) -> str:
     """Generate a deterministic SVG avatar with gradient background."""
-    h = __hashlib.md5(username.encode()).digest()
+    h = _hashlib.md5(username.encode()).digest()
     hue = ((h[0] << 8 | h[1]) * 137.508) % 360
     c1 = f'hsl({hue:.0f}, 70%, 45%)'
     c2 = f'hsl({(hue + 40) % 360:.0f}, 70%, 55%)'
