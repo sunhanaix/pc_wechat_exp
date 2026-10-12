@@ -169,6 +169,7 @@ def hardlink_media():
         'media_type': request.args.get('type', 0, type=int),
         'file_name': request.args.get('file_name', ''),
         'local_id': request.args.get('local_id', 0, type=int),
+        'quality': request.args.get('quality', ''),
     }
     return serve_hardlink_media(decrypted_dir, media_info, wxid)
 

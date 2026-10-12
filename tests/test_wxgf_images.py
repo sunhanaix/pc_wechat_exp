@@ -34,13 +34,13 @@ class TestSniffImageMime:
 
 
 class TestSiblingThumbnail:
-    def test_prefers_t_suffix(self, tmp_path):
+    def test_prefers_hd_suffix(self, tmp_path):
         original = tmp_path / "abc.dat"
         original.write_bytes(b"wxgf-original")
         (tmp_path / "abc_t.dat").write_bytes(b"jpeg-thumb")
         (tmp_path / "abc_h.dat").write_bytes(b"jpeg-big-thumb")
         got = media._find_sibling_thumbnail(str(original))
-        assert got is not None and got.endswith("abc_t.dat")
+        assert got is not None and got.endswith("abc_h.dat")
 
     def test_falls_back_to_h_suffix(self, tmp_path):
         original = tmp_path / "abc.dat"
@@ -53,11 +53,13 @@ class TestSiblingThumbnail:
         original.write_bytes(b"x")
         assert media._find_sibling_thumbnail(str(original)) is None
 
-    def test_thumbnail_input_returns_none(self, tmp_path):
+    def test_thumbnail_input_finds_full_size_sibling(self, tmp_path):
         thumb = tmp_path / "abc_t.dat"
         thumb.write_bytes(b"x")
         (tmp_path / "abc_t_t.dat").write_bytes(b"y")
         assert media._find_sibling_thumbnail(str(thumb)) is None
+        (tmp_path / "abc_h.dat").write_bytes(b"hd")
+        assert media._find_sibling_thumbnail(str(thumb)).endswith("abc_h.dat")
 
 
 class TestInstallFromZip:
