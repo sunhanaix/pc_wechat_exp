@@ -201,6 +201,30 @@ def _resolve_hardlink_path(decrypted_dir: str, media_info: dict, wxid: str = Non
     if not media_info:
         return None
 
+    if media_info.get('media_type') == 3 and media_info.get('quality') == 'original':
+        # WeChat's _h file is the HD image; the bare file can be a smaller
+        # wxgf version. Resolve HD explicitly before the ordinary fallback chain.
+        full_info = dict(media_info)
+        full_info.pop('quality', None)
+        full_info['md5'] = re.sub(r'_[th]$', '', full_info.get('md5', ''))
+        for field in ('local_path', 'file_name'):
+            full_info[field] = re.sub(r'_[th](?=\.[^./\\]+$)', '',
+                                      full_info.get(field, '') or '')
+        if not full_info['local_path'] and full_info['md5']:
+            db_path = _resolve_from_hardlink_db(decrypted_dir, full_info['md5'], 3)
+            full_info['local_path'] = re.sub(r'_[th](?=\.[^./\\]+$)', '', db_path or '')
+        hd_info = dict(full_info)
+        hd_info['md5'] = full_info['md5'] + '_h' if full_info['md5'] else ''
+        for field in ('local_path', 'file_name'):
+            value = full_info[field]
+            if value:
+                base, ext = os.path.splitext(value)
+                hd_info[field] = base + '_h' + ext
+        if not hd_info['file_name'] and full_info['md5']:
+            hd_info['file_name'] = full_info['md5'] + '_h.dat'
+        return (_resolve_hardlink_path(decrypted_dir, hd_info, wxid)
+                or _resolve_hardlink_path(decrypted_dir, full_info, wxid))
+
     local_path = media_info.get('local_path')
     md5 = media_info.get('md5', '')
     media_type = media_info.get('media_type', 0)
@@ -256,7 +280,8 @@ def _resolve_hardlink_path(decrypted_dir: str, media_info: dict, wxid: str = Non
             return result
 
     # Fallback: look up md5 in HardLink DB and construct path
-    if md5 and len(md5) == 32:
+    if md5 and (len(md5) == 32 or
+                (media_type == 3 and len(re.sub(r'_[th]$', '', md5)) == 32)):
         result = _resolve_from_hardlink_db(decrypted_dir, md5, media_type)
         print(f"  [RESOLVE] bare md5={md5[:16]}... hldb_result={result}")
         if result:
@@ -1421,17 +1446,25 @@ def _convert_wxgf_with_ffmpeg(data: bytes):
 
 
 def _find_sibling_thumbnail(resolved_path: str) -> str:
-    """原图是 wxgf 时，找同目录下 WeChat 生成的 _t/_h 缩略图（通常是 JPEG）。"""
+    """找同目录的可用替代图，优先高清 _h，再用缩略图 _t。"""
+    return next(iter(_sibling_image_variants(resolved_path)), None)
+
+
+def _sibling_image_variants(resolved_path: str) -> list:
     if not resolved_path:
-        return None
+        return []
     base, ext = os.path.splitext(resolved_path)
-    if base.endswith("_t") or base.endswith("_h"):
-        return None
-    for suffix in ("_t", "_h"):
+    current = ''
+    if base.endswith(('_t', '_h')):
+        current, base = base[-2:], base[:-2]
+    candidates = []
+    for suffix in ("_h", "", "_t"):
+        if suffix == current:
+            continue
         for cand in (base + suffix + ext, base + suffix + ".dat"):
-            if os.path.isfile(cand) and os.path.getsize(cand) > 0:
-                return cand
-    return None
+            if cand not in candidates and os.path.isfile(cand) and os.path.getsize(cand) > 0:
+                candidates.append(cand)
+    return candidates
 
 def _decrypt_dat_v2(file_path: str, aes_key: bytes, xor_key: int = None, output_dir: str = None) -> str:
     """Decrypt a V2 .dat file using AES-128-ECB key + XOR tail.
@@ -1796,7 +1829,8 @@ def serve_hardlink_media(decrypted_dir: str, media_info: dict, wxid: str = None)
                         and _image_completeness(dec_path, mime) is False):
                     _stash_incomplete(dec_path, mime, source_tag, key_src=key_src)
                     return None
-                resp = send_file(os.path.abspath(dec_path), mimetype=mime, max_age=86400)
+                resp = send_file(os.path.abspath(dec_path), mimetype=mime,
+                                 max_age=0 if source_tag else 86400)
                 if source_tag:
                     resp.headers['X-WeChat-Image-Source'] = source_tag
                 return resp
@@ -1827,7 +1861,7 @@ def serve_hardlink_media(decrypted_dir: str, media_info: dict, wxid: str = None)
             # to NEVER decrypt local .dat files. Only memory-extracted keys
             # (from harvest-keys) can decrypt V2 files.
             _md5_variants = []
-            if md5_val and len(md5_val) == 32:
+            if md5_val and len(re.sub(r'_[th]$', '', md5_val)) == 32:
                 _md5_variants = [md5_val]
                 # Add common WeChat thumbnail suffixes (_h, _t) and strip suffix for lookup
                 for _suffix in ('_h', '_t'):
@@ -1898,7 +1932,9 @@ def serve_hardlink_media(decrypted_dir: str, media_info: dict, wxid: str = None)
                 #    而它是这条链路里唯一可能跑几十秒的一步 ⇒ 用户只看到"图片解密异常漫长"
                 #    却没有任何日志能指向它。现在把它的日志接出来 + 打印耗时。
                 from engine.services.v2_key_extract import find_keys_for_files, is_wechat_running
-                if not is_wechat_running():
+                if _found_key['aes']:
+                    print("  [V2] 已成功解密 wxgf：跳过重复内存扫描，尝试同目录高清图", flush=True)
+                elif not is_wechat_running():
                     print("  [V2] 内存密钥路径：微信未运行 ⇒ 跳过（这一步需要微信在跑）",
                           flush=True)
                 else:
@@ -1934,10 +1970,8 @@ def serve_hardlink_media(decrypted_dir: str, media_info: dict, wxid: str = None)
                     print(f"  [V2] 内存密钥路径：结束（{_time.time() - _mem_t0:.1f}s，"
                           f"{'取到密钥' if _mem_found_any else '未取到密钥'}）", flush=True)
 
-            # 3b) wxgf 兜底：原图是微信私有 H.265 图片且本机无解码器时，
-            #     改用同目录 WeChat 生成的 _t/_h 缩略图（一般为 JPEG）
-            thumb_src = _find_sibling_thumbnail(resolved)
-            if thumb_src:
+            # 原版本不能解码时，按高清 _h → 普通图 → 小缩略图 _t 尝试。
+            for thumb_src in _sibling_image_variants(resolved):
                 cache_dir = os.path.join(os.path.dirname(decrypted_dir), 'decrypted_media')
                 key_pairs = []
                 if _found_key['aes']:
@@ -1955,10 +1989,13 @@ def serve_hardlink_media(decrypted_dir: str, media_info: dict, wxid: str = None)
                     except Exception:
                         _dec = None
                     if _dec and os.path.isfile(_dec):
-                        _rv = _serve_decrypted(_dec, source_tag='thumbnail',
+                        _source = ('hd-image' if os.path.splitext(thumb_src)[0].endswith('_h')
+                                   else 'thumbnail' if os.path.splitext(thumb_src)[0].endswith('_t')
+                                   else 'image')
+                        _rv = _serve_decrypted(_dec, source_tag=_source,
                                               key_src='thumbnail')
                         if _rv:
-                            print(f"  [WXGF] 原图不可解码，已回退缩略图: {os.path.basename(thumb_src)}")
+                            print(f"  [WXGF] 已使用同目录替代图（{_source}）: {os.path.basename(thumb_src)}")
                             return _rv
 
             # 4) Thumbnail cache fallback — WeChat stores decrypted thumbnails
@@ -1977,7 +2014,9 @@ def serve_hardlink_media(decrypted_dir: str, media_info: dict, wxid: str = None)
                     _stash_incomplete(thumb, _thumb_mime, 'thumbnail-cache', more_steps=False)
                 else:
                     mime, _ = mimetypes.guess_type(thumb)
-                    return send_file(thumb, mimetype=mime or 'image/jpeg', max_age=86400)
+                    resp = send_file(thumb, mimetype=mime or 'image/jpeg', max_age=0)
+                    resp.headers['X-WeChat-Image-Source'] = 'thumbnail-cache'
+                    return resp
 
             # 4b) issue #46：候选链走完仍**没有**任何通过校验的候选
             #     ⇒ 回退返回暂存的"最大"那个未校验候选。绝不 404 / 415 / 500：

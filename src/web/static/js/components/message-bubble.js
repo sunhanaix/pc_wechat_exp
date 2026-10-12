@@ -121,6 +121,7 @@ class MessageBubble extends Component {
           lightboxUrl = api.hardlinkMediaUrl({...mi, md5: fullMd5, local_path: fullPath, file_name: fullName}, 3, m.id) || imgUrl;
         }
       }
+      if (lightboxUrl) lightboxUrl += '&quality=original';
       const isWx4 = mi && mi.file_name && mi.file_name.endsWith('.dat') && !mi.file_name.endsWith('_W.dat');
       if (imgUrl) {
         const fallbackMsg = isWx4 ? 'V2加密图片无法解码 — 请在微信中查看该图片后刷新重试' : '图片已过期或不可访问';

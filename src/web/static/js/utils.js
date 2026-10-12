@@ -80,7 +80,13 @@ const showLoading = () => { document.getElementById('message-list').innerHTML = 
 
 const showError = (msg) => { document.getElementById('message-list').innerHTML = `<div class="error-msg">&#x26a0; ${escapeHtml(msg)}</div>`; };
 
-const openLightbox = (url) => { document.getElementById('lightbox-img').src = url; document.getElementById('lightbox').style.display = 'flex'; };
+const openLightbox = (url) => {
+  const lightbox = document.getElementById('lightbox');
+  lightbox.classList.remove('zoomed');
+  lightbox.scrollTop = lightbox.scrollLeft = 0;
+  document.getElementById('lightbox-img').src = url;
+  lightbox.style.display = 'flex';
+};
 
 const showChatUI = (show) => {
   const d = show ? '' : 'none';

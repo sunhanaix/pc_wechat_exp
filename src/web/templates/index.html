@@ -266,7 +266,7 @@ window.WhisperTranscriber = {
 
 <div id="lightbox" class="lightbox" style="display:none" onclick="this.style.display='none'">
   <span class="lightbox-close">&times;</span>
-  <img id="lightbox-img" src="" alt="">
+  <img id="lightbox-img" src="" alt="图片" title="点击切换实际尺寸，可滚动查看" onclick="event.stopPropagation();this.parentElement.classList.toggle('zoomed')">
 </div>
 
 <audio id="audio-player" style="display:none" controls></audio>
