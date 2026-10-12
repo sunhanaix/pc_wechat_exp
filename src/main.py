@@ -168,6 +168,38 @@ def cmd_backup(args):
         print(f"\n备份失败: {result['errors']}")
 
 
+def cmd_sync(args):
+    """Run an independent message-sync worker until Ctrl+C."""
+    import json
+    import time
+    from engine.config_file import get_db_dir
+    from engine.services.live_sync import MessageSyncService
+    source = args.db_dir or get_db_dir()
+    if not source:
+        print('请用 --db-dir 指定微信 db_storage 目录')
+        return 1
+    try:
+        service = MessageSyncService(source, args.output, args.interval)
+        if args.once:
+            state = service.run_once()
+            print(json.dumps(state, ensure_ascii=False, indent=2))
+            return 0 if state['ready'] and not state['last_error'] else 1
+        service.start()
+        print('消息同步已启动，实时目录: ' + str(service.output))
+        print('按 Ctrl+C 停止；可用 serve --decrypted-dir <实时目录> 查看数据')
+        try:
+            while service.status()['running']:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+        finally:
+            service.stop()
+        return 0 if not service.status()['last_error'] else 1
+    except (ValueError, OSError) as exc:
+        print('同步启动失败: ' + str(exc))
+        return 1
+
+
 def cmd_serve(args):
     """Start the web chat viewer."""
     from web.app import run_server
@@ -1056,6 +1088,12 @@ def main():
     sp.add_argument('--host', default='127.0.0.1')
     sp.add_argument('--port', type=int, default=5000)
 
+    sy = sub.add_parser('sync', help='独立同步微信源库中的新消息（Ctrl+C 停止）')
+    sy.add_argument('--db-dir', help='微信 db_storage 目录；默认使用已配置目录')
+    sy.add_argument('--output', help='独立的空实时目录；默认 output/live_sync/<账号标识>')
+    sy.add_argument('--interval', type=float, default=1, help='提交状态复核间隔（秒，默认 1）')
+    sy.add_argument('--once', action='store_true', help='执行一次同步并退出')
+
     # export
     ep = sub.add_parser('export', help='导出聊天记录 / 通讯录 / 词云 / 报告 / 员工报表')
     ep.add_argument('--transcribe-missing', dest='transcribe_missing', action='store_true', help='导出时给还没转写的语音现场识别一次（较慢）')
@@ -1194,6 +1232,8 @@ def main():
         cmd_backup(args)
     elif args.command == 'serve':
         cmd_serve(args)
+    elif args.command == 'sync':
+        _exit_with(cmd_sync(args))
     elif args.command == 'export':
         cmd_export(args)
     elif args.command == 'voice-export':

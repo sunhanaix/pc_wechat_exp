@@ -48,6 +48,7 @@ BLUEPRINT_GUARDS = (
     ('routes.keys_api', 'web.routes.keys_api'),
     ('routes.pull_api', 'web.routes.pull_api'),
     ('routes.search_api', 'web.routes.search_api'),
+    ('routes.sync_api', 'web.routes.sync_api'),
 )
 
 
@@ -215,7 +216,7 @@ class TestNormalPathIsUntouched:
                  for r in caplog.records if r.levelno >= logging.WARNING]
         assert noisy == [], '正常导入路径产生了日志记录：%r' % (noisy,)
 
-    def test_blueprint_registration_order_is_unchanged(self, tmp_path):
+    def test_existing_blueprint_registration_order_is_preserved(self, tmp_path):
         """注册顺序是既有行为的一部分（`app.url_map` 的规则顺序由它决定）—— 重构不得改变。
 
         `app.blueprints` 是 dict（3.7+ 保序），键就是蓝图的 name 属性，所以它能
@@ -226,4 +227,5 @@ class TestNormalPathIsUntouched:
         assert tuple(app.blueprints) == (
             'api', 'reports', 'wrapped', 'backup_api', 'export_api',
             'voice_export_api', 'avatar', 'cleanup', 'keys_api', 'pull_api', 'search_api',
+            'sync_api',
         )
