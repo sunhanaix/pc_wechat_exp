@@ -1,4 +1,5 @@
 let currentController = null;
+let pendingRequests = 0;
 
 function cancelPending() {
   if (currentController) { currentController.abort(); }
@@ -7,19 +8,25 @@ function cancelPending() {
 }
 
 async function fetchJSON(url, signal) {
-  const resp = await fetch(url, { signal });
-  if (!resp.ok) {
-    let msg = `HTTP ${resp.status}`;
-    try {
-      const body = await resp.json();
-      if (body && body.error) msg = body.error;
-    } catch (_) { /* use default status message */ }
-    throw new Error(msg);
+  pendingRequests++;
+  try {
+    const resp = await fetch(url, { signal });
+    if (!resp.ok) {
+      let msg = `HTTP ${resp.status}`;
+      try {
+        const body = await resp.json();
+        if (body && body.error) msg = body.error;
+      } catch (_) { /* use default status message */ }
+      throw new Error(msg);
+    }
+    return await resp.json();
+  } finally {
+    pendingRequests--;
   }
-  return resp.json();
 }
 
 const api = {
+  isBusy() { return pendingRequests > 0; },
   contacts(q, limit, offset) {
     const signal = cancelPending();
     const qs = new URLSearchParams();

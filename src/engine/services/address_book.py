@@ -291,6 +291,12 @@ _ALL_CONTACTS_CACHE = {}
 _EXTRA_CACHE = {}
 
 
+def invalidate_address_book(decrypted_dir: str):
+    """Contact data can change while the live synchronization service is running."""
+    _ALL_CONTACTS_CACHE.pop(f'_contacts_cache_{decrypted_dir}', None)
+    _EXTRA_CACHE.pop(f'_extra_cache_{decrypted_dir}', None)
+
+
 def _attach_chat_stats(decrypted_dir: str, contacts: dict) -> None:
     """Enrich contacts dict with msg_count and last_msg_time from chats.db."""
     chats_db = _find_chats_db(decrypted_dir)

@@ -1,0 +1,24 @@
+{% extends "base.html" %}
+{% block title %}实时消息同步 — WeChat EXP{% endblock %}
+{% block content %}
+<a href="/" class="back-link">← 返回仪表盘</a>
+<h2>实时消息同步</h2>
+<p>微信收到新消息后，自动同步到独立的实时目录。启动完成后，聊天查看器会使用这份数据并自动更新。</p>
+<div class="config-panel" style="padding:20px;max-width:850px">
+  <label for="sync-source">微信 db_storage 目录</label>
+  <input id="sync-source" type="text" style="width:100%;margin:8px 0 18px" placeholder="当前微信账号的 db_storage 目录">
+  <label for="sync-output">实时数据目录（留空自动创建）</label>
+  <input id="sync-output" type="text" style="width:100%;margin:8px 0 18px" placeholder="独立的空目录；原备份保留">
+  <div style="display:flex;gap:12px;flex-wrap:wrap">
+    <button class="btn" id="sync-start">启动同步</button>
+    <button class="btn" id="sync-stop">停止同步</button>
+    <a class="btn" href="/chat">打开聊天查看器</a>
+  </div>
+  <p id="sync-error" role="alert" style="color:#ff7b72"></p>
+  <dl id="sync-state" aria-live="polite" style="display:grid;grid-template-columns:max-content minmax(0,1fr);gap:10px;overflow-wrap:anywhere"></dl>
+</div>
+<p style="color:#8b949e">停止后保留已同步的数据。关闭本程序会停止后台同步；下次需重新启动。新账号或新分片缺少密钥时，可先在“提取密钥”或“手动输入密钥”中补齐。</p>
+{% endblock %}
+{% block scripts %}
+<script src="{{ url_for('static', filename='js/sync-control.js') }}"></script>
+{% endblock %}
