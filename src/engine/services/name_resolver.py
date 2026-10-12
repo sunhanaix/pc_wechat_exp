@@ -65,16 +65,6 @@ def extract_chatroom_name(ext_buffer: bytes) -> str | None:
 _chatroom_names_cache = {}          # decrypted_dir -> (指纹, 映射)
 
 
-def invalidate_names(decrypted_dir: str):
-    """Invalidate cached names after a live contact snapshot is committed."""
-    prefix = str(decrypted_dir) + ':'
-    with _name_cache_lock:
-        for key in list(_name_cache):
-            if key.startswith(prefix):
-                del _name_cache[key]
-        _chatroom_names_cache.pop(os.path.abspath(decrypted_dir), None)
-
-
 def _dir_fingerprint(decrypted_dir: str) -> str:
     """数据目录指纹：各子目录下 *.db 的 (目录/名称, 大小, mtime)。任一变化即失效。"""
     parts = []

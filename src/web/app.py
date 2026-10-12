@@ -155,12 +155,6 @@ def create_app(decrypted_dir: str, wxid: str = None, db_dir: str = None) -> Flas
     # 500（与原先的 NameError 同类），但不会把整个 app 拖垮。
     _search_type_options = _register_blueprint(app, 'routes.search_api', _register_search_bp)
 
-    def _register_sync_bp():
-        from .routes.sync_api import init_sync
-        init_sync(app)
-
-    _register_blueprint(app, 'routes.sync_api', _register_sync_bp)
-
     # JSON error handlers — prevent Flask HTML pages for API routes
     @app.errorhandler(404)
     def _json_404(e):
@@ -179,10 +173,6 @@ def create_app(decrypted_dir: str, wxid: str = None, db_dir: str = None) -> Flas
     @app.route('/chat')
     def chat():
         return render_template('index.html')
-
-    @app.route('/sync')
-    def sync_page():
-        return render_template('sync.html')
 
     # Wizard pages
     @app.route('/backup')
