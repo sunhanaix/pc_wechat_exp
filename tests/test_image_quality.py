@@ -52,6 +52,49 @@ def test_original_prefers_hd_over_decodable_medium(images):
 
 
 @pytest.mark.parametrize('suffix', ['', '_t', '_h'])
+def test_preview_stays_thumbnail_when_original_is_available(images, suffix):
+    encrypted(images / f'{MD5}.dat', b'\xff\xd8\xff\xe0full-image\xff\xd9')
+    encrypted(images / f'{MD5}_t.dat', b'\xff\xd8\xff\xe0preview\xff\xd9')
+    app = Flask(__name__)
+    app.config['DECRYPTED_DIR'] = str(images.parent.parent)
+    app.register_blueprint(api_bp, url_prefix='/api')
+    with app.test_client() as client:
+        preview = client.get(f'/api/hardlink-media?type=3&md5={MD5}{suffix}&quality=thumbnail')
+        original = client.get(f'/api/hardlink-media?type=3&md5={MD5}{suffix}&quality=original')
+        assert preview.status_code == original.status_code == 200
+        assert preview.data == b'\xff\xd8\xff\xe0preview\xff\xd9'
+        assert original.data == b'\xff\xd8\xff\xe0full-image\xff\xd9'
+
+
+def test_preview_without_thumbnail_keeps_available_image(images):
+    image = images / f'{MD5}.dat'
+    image.write_bytes(b'available-image')
+    result = media._resolve_hardlink_path(str(images.parent.parent),
+                                        {'md5': MD5, 'media_type': 3, 'quality': 'thumbnail'})
+    assert os.path.samefile(result, image)
+
+
+def test_original_rechecks_when_wechat_downloads_full_image_later(images):
+    preview = b'\xff\xd8\xff\xe0preview\xff\xd9'
+    full = b'\xff\xd8\xff\xe0downloaded-full-image\xff\xd9'
+    encrypted(images / f'{MD5}_t.dat', preview)
+    app = Flask(__name__)
+    app.config['DECRYPTED_DIR'] = str(images.parent.parent)
+    app.register_blueprint(api_bp, url_prefix='/api')
+    url = f'/api/hardlink-media?type=3&md5={MD5}&quality=original'
+    with app.test_client() as client:
+        before = client.get(url)
+        assert before.data == preview
+        assert before.headers['X-WeChat-Image-Source'] == 'thumbnail'
+        assert before.cache_control.max_age == 0
+        encrypted(images / f'{MD5}.dat', full)
+        after = client.get(url, headers={'If-None-Match': before.headers['ETag']})
+        assert after.status_code == 200
+        assert after.data == full
+        assert after.cache_control.max_age == 0
+
+
+@pytest.mark.parametrize('suffix', ['', '_t', '_h'])
 def test_original_normalizes_thumbnail_references(images, suffix):
     hd = images / f'{MD5}_h.dat'
     hd.write_bytes(b'high-definition')

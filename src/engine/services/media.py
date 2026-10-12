@@ -201,6 +201,25 @@ def _resolve_hardlink_path(decrypted_dir: str, media_info: dict, wxid: str = Non
     if not media_info:
         return None
 
+    if media_info.get('media_type') == 3 and media_info.get('quality') == 'thumbnail':
+        # Keep the inline preview small even when a full-size wxgf is decodable.
+        preview_info = dict(media_info)
+        preview_info.pop('quality', None)
+        base_md5 = re.sub(r'_[th]$', '', preview_info.get('md5', ''))
+        preview_info['md5'] = base_md5 + '_t' if base_md5 else ''
+        for field in ('local_path', 'file_name'):
+            value = re.sub(r'_[th](?=\.[^./\\]+$)', '',
+                           preview_info.get(field, '') or '')
+            if value:
+                base, ext = os.path.splitext(value)
+                preview_info[field] = base + '_t' + ext
+        if not preview_info.get('file_name') and base_md5:
+            preview_info['file_name'] = base_md5 + '_t.dat'
+        fallback_info = dict(media_info)
+        fallback_info.pop('quality', None)
+        return (_resolve_hardlink_path(decrypted_dir, preview_info, wxid)
+                or _resolve_hardlink_path(decrypted_dir, fallback_info, wxid))
+
     if media_info.get('media_type') == 3 and media_info.get('quality') == 'original':
         # WeChat's _h file is the HD image; the bare file can be a smaller
         # wxgf version. Resolve HD explicitly before the ordinary fallback chain.
@@ -1829,8 +1848,14 @@ def serve_hardlink_media(decrypted_dir: str, media_info: dict, wxid: str = None)
                         and _image_completeness(dec_path, mime) is False):
                     _stash_incomplete(dec_path, mime, source_tag, key_src=key_src)
                     return None
+                if not source_tag:
+                    stem = os.path.splitext(resolved)[0]
+                    if stem.endswith('_t'):
+                        source_tag = 'thumbnail'
+                    elif stem.endswith('_h'):
+                        source_tag = 'hd-image'
                 resp = send_file(os.path.abspath(dec_path), mimetype=mime,
-                                 max_age=0 if source_tag else 86400)
+                                 max_age=0 if source_tag or media_info.get('quality') == 'original' else 86400)
                 if source_tag:
                     resp.headers['X-WeChat-Image-Source'] = source_tag
                 return resp

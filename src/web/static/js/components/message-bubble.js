@@ -108,9 +108,9 @@ class MessageBubble extends Component {
       const mi = m.media_info;
       const hlUrl = api.hardlinkMediaUrl(mi, 3, m.id);
       const imgPath = p.image_path || p.thumb_path || '';
-      const imgUrl = hlUrl || (imgPath ? api.mediaUrl(imgPath) : '');
+      const imgUrl = hlUrl ? hlUrl + '&quality=thumbnail' : (imgPath ? api.mediaUrl(imgPath) : '');
       // Lightbox: strip _t/_h suffix to request full-size image
-      let lightboxUrl = imgUrl;
+      let lightboxUrl = hlUrl || imgUrl;
       if (mi && mi.md5 && hlUrl) {
         const stripSuffix = (s) => (s && (s.endsWith('_t') || s.endsWith('_h'))) ? s.slice(0, -2) : s;
         const stripPathSuffix = (s) => (s || '').replace(/_(t|h)(?=\.\w+$)/, '');
